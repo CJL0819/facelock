@@ -64,6 +64,7 @@ static BOOL APLAuthServiceReady(void) {
 @property (nonatomic, copy) NSString *appName;
 @property (nonatomic, copy) void (^onUnlocked)(void);
 - (void)authenticate;
+- (void)resetAutoAttempts;
 - (void)setStatusText:(NSString *)text;
 @end
 
@@ -92,6 +93,8 @@ static UIColor *APLAccentColor(void) {
     BOOL _authenticating;
     BOOL _passcodeInFlight;
     BOOL _didPrompt;
+    NSUInteger _autoAttempts;
+    BOOL _requestWasAutomatic;
     uint32_t _requestToken;
     int _resultHandle;
 }
@@ -198,7 +201,7 @@ static UIColor *APLAccentColor(void) {
 
 - (void)unlockTapped:(id)sender {
     os_log(TweakLog(), "unlock button tapped");
-    [self authenticate];
+    [self requestFaceIDAutomatic:NO];
 }
 
 - (void)passcodeTapped:(id)sender {
@@ -214,10 +217,25 @@ static UIColor *APLAccentColor(void) {
 
 #pragma mark Face ID, asked of SpringBoard
 
+- (void)resetAutoAttempts {
+    _autoAttempts = 0;
+}
+
+// Three automatic tries per lock; after that the buttons are the way in, and
+// nothing pops up on its own.
 - (void)authenticate {
+    if (_autoAttempts >= 3) {
+        os_log(TweakLog(), "three automatic Face ID tries spent, waiting for a tap");
+        return;
+    }
+    [self requestFaceIDAutomatic:YES];
+}
+
+- (void)requestFaceIDAutomatic:(BOOL)automatic {
     if (_authenticating) {
         return;
     }
+    _requestWasAutomatic = automatic;
     if (!APLAuthServiceReady()) {
         os_log(TweakLog(), "auth service not ready");
         [self setStatusText:@"面容 ID 服务未就绪：请先重新启动桌面（respring），或用密码解锁"];
@@ -269,12 +287,17 @@ static UIColor *APLAccentColor(void) {
         }
         self->_authenticating = NO;
         BOOL granted = (state & 1) != 0;
-        os_log(TweakLog(), "Face ID answer granted=%d", (int)granted);
+        os_log(TweakLog(), "Face ID answer granted=%d automatic=%d", (int)granted, (int)self->_requestWasAutomatic);
         if (granted) {
+            self->_autoAttempts = 0;
             [self setStatusText:nil];
             if (self.onUnlocked) {
                 self.onUnlocked();
             }
+        } else if (self->_requestWasAutomatic) {
+            // A failed automatic try hands over quietly to the user.
+            self->_autoAttempts += 1;
+            [self setStatusText:nil];
         } else {
             [self setStatusText:@"面容 ID 未通过，可重试或使用密码"];
         }
@@ -287,7 +310,12 @@ static UIColor *APLAccentColor(void) {
             return;
         }
         strongSelf->_authenticating = NO;
-        [strongSelf setStatusText:@"面容 ID 没有回应，请重试"];
+        if (strongSelf->_requestWasAutomatic) {
+            strongSelf->_autoAttempts += 1;
+            [strongSelf setStatusText:nil];
+        } else {
+            [strongSelf setStatusText:@"面容 ID 没有回应，请重试"];
+        }
     });
 }
 
@@ -428,6 +456,15 @@ static void APLShowLock(void) {
     }
 }
 
+// Engage the lock. A new lock also gives Face ID its three automatic tries
+// again.
+static void APLLockApp(void) {
+    sLocked = YES;
+    sPrompted = NO;
+    [sLockController resetAutoAttempts];
+    APLShowLock();
+}
+
 static void APLPromptIfNeeded(void) {
     if (!sLocked || sPrompted || sLockController == nil) {
         return;
@@ -531,9 +568,7 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
     }
     if (!wasProtected) {
         // Newly protected, or the launch read: lock before anything is usable.
-        sLocked = YES;
-        sPrompted = NO;
-        APLShowLock();
+        APLLockApp();
         APLPromptIfNeeded();
         return;
     }
@@ -602,8 +637,7 @@ static void APLInstallObservers(void) {
             NSTimeInterval away = -[sBackgroundDate timeIntervalSinceNow];
             if (away >= (NSTimeInterval)sLockDelay) {
                 os_log(TweakLog(), "away %.0fs, locking", away);
-                sLocked = YES;
-                sPrompted = NO;
+                APLLockApp();
             }
         }
         sBackgroundDate = nil;
@@ -626,9 +660,7 @@ static void APLInstallObservers(void) {
         }
         sBackgroundDate = [NSDate date];
         if (sLockDelay == 0) {
-            sLocked = YES;
-            sPrompted = NO;
-            APLShowLock();
+            APLLockApp();
         }
     }];
 
@@ -641,9 +673,7 @@ static void APLInstallObservers(void) {
             return;
         }
         os_log(TweakLog(), "device locked, locking app");
-        sLocked = YES;
-        sPrompted = NO;
-        APLShowLock();
+        APLLockApp();
     }];
 
     [center addObserverForName:UISceneWillConnectNotification
