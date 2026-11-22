@@ -238,6 +238,9 @@ static UIColor *APLAccentColor(void) {
         if (strongSelf == nil || strongSelf.view.window == nil) {
             return;  // unlocked, or the lock screen is gone
         }
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+            return;  // the app left the foreground: never prompt from behind it
+        }
         [strongSelf requestFaceIDAutomatic:YES];
     });
 }
@@ -1109,6 +1112,22 @@ static void APLSetupSpringBoardService(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *__unused note) {
         APLPublishDeviceLockStamp();
+    }];
+
+    // An app installed after the service started would have no listener, so its
+    // Face ID request would go nowhere: refresh the list when the device comes
+    // back from the lock screen, at most every half minute.
+    static NSTimeInterval lastRefresh;
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *__unused note) {
+        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        if (now - lastRefresh < 30.0) {
+            return;
+        }
+        lastRefresh = now;
+        APLRefreshAuthListeners();
     }];
 
     // Warm the biometric service, so the first prompt after a launch does not
