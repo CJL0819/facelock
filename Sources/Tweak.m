@@ -141,8 +141,12 @@ static UIColor *APLAccentColor(void) {
     _statusLabel.font = [UIFont systemFontOfSize:13.0];
     _statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0];
     _statusLabel.textAlignment = NSTextAlignmentCenter;
-    _statusLabel.numberOfLines = 0;
-    _statusLabel.hidden = YES;
+    _statusLabel.numberOfLines = 2;
+    _statusLabel.text = @"";
+    // Always in the layout, with room for two lines: a status that comes and
+    // goes would move everything above it on the lock screen.
+    _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [_statusLabel.heightAnchor constraintEqualToConstant:38.0].active = YES;
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[iconView, titleLabel, nameLabel, hintLabel, _unlockButton, _passcodeButton, _statusLabel]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -187,8 +191,7 @@ static UIColor *APLAccentColor(void) {
 }
 
 - (void)setStatusText:(NSString *)text {
-    _statusLabel.text = text;
-    _statusLabel.hidden = text.length == 0;
+    _statusLabel.text = text ?: @"";
 }
 
 #pragma mark Face ID, asked of SpringBoard

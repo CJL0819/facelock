@@ -93,6 +93,14 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     return _specifiers;
 }
 
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSArray<NSNumber *> *values = APLLockDelayValues();
+    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
+    BOOL selected = indexPath.row < (NSInteger)values.count && values[indexPath.row].integerValue == current;
+    cell.accessoryType = selected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    cell.tintColor = [UIColor colorWithRed:0.0 green:0.478 blue:1.0 alpha:1.0];
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSArray<NSNumber *> *values = APLLockDelayValues();
@@ -131,11 +139,21 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    // The delay page may have changed the row's value behind this one.
+    // The delay page may have changed the value behind this row: show it.
     PSSpecifier *delay = [self specifierForID:@"lockDelay"];
     if (delay != nil) {
+        delay.name = [self delayRowName];
         [self reloadSpecifier:delay];
     }
+}
+
+/// The row's label carries the choice, so the pane shows it without opening
+/// the page again.
+- (NSString *)delayRowName {
+    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
+    NSUInteger index = [APLLockDelayValues() indexOfObject:@(current)];
+    NSString *title = index == NSNotFound ? @"立即" : APLLockDelayTitles()[index];
+    return [NSString stringWithFormat:@"后台锁定时机 · %@", title];
 }
 
 - (NSArray *)specifiers {
@@ -163,7 +181,7 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
                  forKey:@"footerText"];
     [specifiers addObject:timing];
 
-    PSSpecifier *delay = [PSSpecifier preferenceSpecifierNamed:@"后台锁定时机"
+    PSSpecifier *delay = [PSSpecifier preferenceSpecifierNamed:[self delayRowName]
                                                         target:self
                                                            set:nil
                                                            get:@selector(delayDescription:)
