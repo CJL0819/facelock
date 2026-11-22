@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
 //
-// The tweak loads into every app process (the package's filter names the
-// UIApplication class, so an app is any process that has one). At launch it
-// reads the package's preferences domain: if this app is protected, a window
-// above the app's own asks for Face ID before anything else is usable, and
-// the app is locked again whenever it goes to the background.
+// The tweak loads into every app process and into SpringBoard (the package's
+// filter names the UIApplication class, which both have).
+//
+// In an app it reads the package's preferences domain: if this app is
+// protected, a window above the app's own holds it until Face ID has passed.
+// The Face ID itself runs in SpringBoard: an app process has no
+// NSFaceIDUsageDescription, and asking LocalAuthentication from one is a TCC
+// violation that kills the app, while SpringBoard's entitlements allow it.
+// The passcode prompt stays in the app, where LocalAuthentication is safe.
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <LocalAuthentication/LocalAuthentication.h>
@@ -27,6 +31,19 @@ static os_log_t TweakLog(void) {
     return log;
 }
 
+#pragma mark - Talking to SpringBoard's auth service
+
+static BOOL APLAuthServiceReady(void) {
+    int handle = 0;
+    if (notify_register_check(APLAuthServiceName().UTF8String, &handle) != NOTIFY_STATUS_OK) {
+        return NO;
+    }
+    uint64_t state = 0;
+    notify_get_state(handle, &state);
+    notify_cancel(handle);
+    return state == 1;
+}
+
 #pragma mark - The lock screen
 
 // The window that sits above the app until Face ID has passed.
@@ -44,6 +61,9 @@ static BOOL sProtected;
 static BOOL sLocked;
 static BOOL sPrompted;
 static BOOL sPrepared;
+static BOOL sLockOnDeviceLock;
+static NSInteger sLockDelay;
+static NSDate *sBackgroundDate;
 static UIWindow *sLockWindow;
 static APLLockViewController *sLockController;
 
@@ -54,9 +74,12 @@ static UIColor *APLAccentColor(void) {
 @implementation APLLockViewController {
     UILabel *_statusLabel;
     UIButton *_unlockButton;
+    UIButton *_passcodeButton;
     LAContext *_context;
     BOOL _authenticating;
     BOOL _didPrompt;
+    uint32_t _requestToken;
+    int _resultHandle;
 }
 
 - (void)viewDidLoad {
@@ -96,15 +119,23 @@ static UIColor *APLAccentColor(void) {
     hintLabel.numberOfLines = 2;
 
     _unlockButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_unlockButton setTitle:@"解锁" forState:UIControlStateNormal];
+    [_unlockButton setTitle:@"使用面容 ID 解锁" forState:UIControlStateNormal];
     [_unlockButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     _unlockButton.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
     _unlockButton.backgroundColor = APLAccentColor();
     _unlockButton.layer.cornerRadius = 23.0;
     _unlockButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [_unlockButton.widthAnchor constraintEqualToConstant:196.0].active = YES;
+    [_unlockButton.widthAnchor constraintEqualToConstant:236.0].active = YES;
     [_unlockButton.heightAnchor constraintEqualToConstant:46.0].active = YES;
     [_unlockButton addTarget:self action:@selector(unlockTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+    _passcodeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_passcodeButton setTitle:@"使用密码" forState:UIControlStateNormal];
+    [_passcodeButton setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.75] forState:UIControlStateNormal];
+    _passcodeButton.titleLabel.font = [UIFont systemFontOfSize:15.0];
+    _passcodeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_passcodeButton.heightAnchor constraintEqualToConstant:32.0].active = YES;
+    [_passcodeButton addTarget:self action:@selector(passcodeTapped:) forControlEvents:UIControlEventTouchUpInside];
 
     _statusLabel = [UILabel new];
     _statusLabel.font = [UIFont systemFontOfSize:13.0];
@@ -113,13 +144,14 @@ static UIColor *APLAccentColor(void) {
     _statusLabel.numberOfLines = 0;
     _statusLabel.hidden = YES;
 
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[iconView, titleLabel, nameLabel, hintLabel, _unlockButton, _statusLabel]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[iconView, titleLabel, nameLabel, hintLabel, _unlockButton, _passcodeButton, _statusLabel]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.alignment = UIStackViewAlignmentCenter;
     stack.spacing = 12.0;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [stack setCustomSpacing:24.0 afterView:hintLabel];
-    [stack setCustomSpacing:16.0 afterView:_unlockButton];
+    [stack setCustomSpacing:4.0 afterView:_unlockButton];
+    [stack setCustomSpacing:12.0 afterView:_passcodeButton];
     [self.view addSubview:stack];
 
     UILayoutGuide *margins = self.view.layoutMarginsGuide;
@@ -150,35 +182,111 @@ static UIColor *APLAccentColor(void) {
     [self authenticate];
 }
 
+- (void)passcodeTapped:(id)sender {
+    [self evaluatePasscode];
+}
+
 - (void)setStatusText:(NSString *)text {
     _statusLabel.text = text;
     _statusLabel.hidden = text.length == 0;
 }
 
+#pragma mark Face ID, asked of SpringBoard
+
 - (void)authenticate {
     if (_authenticating) {
         return;
     }
+    if (!APLAuthServiceReady()) {
+        os_log(TweakLog(), "auth service not ready");
+        [self setStatusText:@"面容 ID 服务未就绪：请先重新启动桌面（respring），或用密码解锁"];
+        return;
+    }
     _authenticating = YES;
+    [self setStatusText:nil];
+
+    uint32_t token = ((uint32_t)arc4random() | 1u);
+    _requestToken = token;
+
+    NSString *requestName = APLAuthRequestName(sBundleID ?: @"");
+    int requestHandle = 0;
+    if (notify_register_check(requestName.UTF8String, &requestHandle) != NOTIFY_STATUS_OK) {
+        _authenticating = NO;
+        [self setStatusText:@"无法请求面容 ID，请重试"];
+        return;
+    }
+    notify_set_state(requestHandle, (uint64_t)token);
+    notify_post(requestName.UTF8String);
+    notify_cancel(requestHandle);
+    os_log(TweakLog(), "asked for Face ID, token %u", token);
+
+    if (_resultHandle != 0) {
+        notify_cancel(_resultHandle);
+        _resultHandle = 0;
+    }
+    NSString *resultName = APLAuthResultName(sBundleID ?: @"");
+    notify_register_dispatch(resultName.UTF8String, &_resultHandle, dispatch_get_main_queue(), ^(int stateHandle) {
+        uint64_t state = 0;
+        if (notify_get_state(stateHandle, &state) != NOTIFY_STATUS_OK) {
+            return;
+        }
+        if ((uint32_t)(state >> 1) != token) {
+            return;  // An older request's answer.
+        }
+        notify_cancel(stateHandle);
+        self->_resultHandle = 0;
+        if (!self->_authenticating) {
+            return;
+        }
+        self->_authenticating = NO;
+        BOOL granted = (state & 1) != 0;
+        os_log(TweakLog(), "Face ID answer granted=%d", (int)granted);
+        if (granted) {
+            [self setStatusText:nil];
+            if (self.onUnlocked) {
+                self.onUnlocked();
+            }
+        } else {
+            [self setStatusText:@"面容 ID 未通过，可重试或使用密码"];
+        }
+    });
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil || !strongSelf->_authenticating || strongSelf->_requestToken != token) {
+            return;
+        }
+        strongSelf->_authenticating = NO;
+        [strongSelf setStatusText:@"面容 ID 没有回应，请重试"];
+    });
+}
+
+#pragma mark Passcode, asked here
+
+// Safe in an app process: this policy asks for the passcode, not for Face ID.
+- (void)evaluatePasscode {
+    if (_authenticating) {
+        return;
+    }
+    _authenticating = YES;
+    [self setStatusText:nil];
 
     LAContext *context = [[LAContext alloc] init];
     _context = context;
-    context.localizedFallbackTitle = @"使用密码";
     context.localizedCancelTitle = @"取消";
 
     NSError *availability = nil;
     if (![context canEvaluatePolicy:LAPolicyDeviceOwnerAuthentication error:&availability]) {
         _authenticating = NO;
         _context = nil;
-        os_log(TweakLog(), "canEvaluatePolicy failed: %{public}s", availability.localizedDescription.UTF8String ?: "(none)");
-        [self setStatusText:availability.localizedDescription.length ? availability.localizedDescription : @"面容 ID 不可用，请先录入面容并设置密码"];
+        [self setStatusText:@"密码验证不可用"];
         return;
     }
 
-    NSString *reason = [NSString stringWithFormat:@"解锁“%@”", self.appName.length ? self.appName : @"此 App"];
     __weak typeof(self) weakSelf = self;
     [context evaluatePolicy:LAPolicyDeviceOwnerAuthentication
-            localizedReason:reason
+            localizedReason:[NSString stringWithFormat:@"解锁“%@”", self.appName.length ? self.appName : @"此 App"]
                       reply:^(BOOL success, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -187,18 +295,15 @@ static UIColor *APLAccentColor(void) {
             }
             strongSelf->_authenticating = NO;
             strongSelf->_context = nil;
-            os_log(TweakLog(), "evaluatePolicy success=%d error=%{public}s",
-                   (int)success, error.localizedDescription.UTF8String ?: "(none)");
+            os_log(TweakLog(), "passcode success=%d error=%{public}s", (int)success, error.localizedDescription.UTF8String ?: "(none)");
             if (success) {
                 [strongSelf setStatusText:nil];
-                [strongSelf->_unlockButton setTitle:@"解锁" forState:UIControlStateNormal];
                 if (strongSelf.onUnlocked) {
                     strongSelf.onUnlocked();
                 }
-            } else {
-                [strongSelf->_unlockButton setTitle:@"重试" forState:UIControlStateNormal];
-                NSString *detail = error.localizedDescription.length ? error.localizedDescription : @"请重试";
-                [strongSelf setStatusText:[NSString stringWithFormat:@"未通过验证：%@", detail]];
+            } else if (error.code != LAErrorUserCancel && error.code != LAErrorSystemCancel && error.code != LAErrorAppCancel) {
+                [strongSelf setStatusText:[NSString stringWithFormat:@"未通过验证：%@",
+                                           error.localizedDescription.length ? error.localizedDescription : @"请重试"]];
             }
         });
     }];
@@ -221,14 +326,6 @@ static UIWindowScene *APLForegroundWindowScene(void) {
         }
         if (fallback == nil) {
             fallback = windowScene;
-        }
-    }
-    if (fallback == nil) {
-        for (UIScene *scene in application.connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                fallback = (UIWindowScene *)scene;
-                break;
-            }
         }
     }
     return fallback;
@@ -329,7 +426,7 @@ static NSString *APLHostDisplayName(void) {
 // cfprefsd keeps this device's domains in the bootstrap's own
 // ~/Library/Preferences, so that file can be read without a cfprefsd round
 // trip. On the launch path the round trip is what hangs a sandboxed app, and
-// the lock has to be up before the app draws anything.
+// from inside a sandboxed app a cfprefsd read of the domain comes back empty.
 static NSDictionary *APLReadSettingsFile(void) {
     NSString *name = [APLPreferencesDomain() stringByAppendingString:@".plist"];
     NSMutableArray<NSString *> *candidates = [NSMutableArray array];
@@ -342,7 +439,6 @@ static NSDictionary *APLReadSettingsFile(void) {
     for (NSUInteger index = 0; index < candidates.count; index++) {
         NSDictionary *domain = [NSDictionary dictionaryWithContentsOfFile:candidates[index]];
         if ([domain isKindOfClass:[NSDictionary class]]) {
-            os_log(TweakLog(), "settings file found at candidate %lu", (unsigned long)index);
             return domain;
         }
     }
@@ -357,15 +453,27 @@ static BOOL APLBoolInDomain(NSDictionary *domain, NSString *key, BOOL fallback) 
     return fallback;
 }
 
-static void APLApplyState(BOOL enabled, BOOL protected) {
-    if (sBundleID.length == 0) {
+static NSInteger APLIntegerInDomain(NSDictionary *domain, NSString *key, NSInteger fallback) {
+    id value = domain[key];
+    if ([value isKindOfClass:[NSNumber class]] || [value isKindOfClass:[NSString class]]) {
+        return [value integerValue];
+    }
+    return fallback;
+}
+
+static void APLApplyDomain(NSDictionary *domain) {
+    if (sBundleID.length == 0 || domain == nil) {
         return;
     }
-    sEnabled = enabled;
-    sProtected = protected;
-    os_log(TweakLog(), "state enabled=%d protected=%d", (int)enabled, (int)protected);
+    BOOL wasProtected = sProtected;
+    sEnabled = APLBoolInDomain(domain, APLKeyForEnabled(), YES);
+    sProtected = APLBoolInDomain(domain, APLKeyForBundle(sBundleID), NO);
+    sLockDelay = APLIntegerInDomain(domain, APLKeyForLockDelay(), 0);
+    sLockOnDeviceLock = APLBoolInDomain(domain, APLKeyForLockOnDeviceLock(), YES);
+    os_log(TweakLog(), "state enabled=%d protected=%d delay=%ld deviceLock=%d",
+           (int)sEnabled, (int)sProtected, (long)sLockDelay, (int)sLockOnDeviceLock);
 
-    if (!(enabled && protected)) {
+    if (!(sEnabled && sProtected)) {
         if (sLocked) {
             sLocked = NO;
             sPrompted = NO;
@@ -373,31 +481,23 @@ static void APLApplyState(BOOL enabled, BOOL protected) {
         }
         return;
     }
-    if (!sLocked) {
-        // Protection was turned on while the app was running: lock it now.
+    if (!wasProtected) {
+        // Newly protected, or the launch read: lock before anything is usable.
         sLocked = YES;
         sPrompted = NO;
         APLShowLock();
         APLPromptIfNeeded();
-    } else if (sLockWindow.hidden) {
+        return;
+    }
+    // Already unlocked by the user: a settings re-read must not lock it again.
+    if (sLocked && sLockWindow.hidden) {
         APLShowLock();
     }
 }
 
-// The file is the only source the tweak trusts: a sandboxed app's cfprefsd
-// read of another domain came back empty on this device, and it would have
-// unlocked the app the file had just locked.
+// The file is the only source the tweak trusts.
 static void APLApplyStateFromFile(void) {
-    if (sBundleID.length == 0) {
-        return;
-    }
-    NSDictionary *domain = APLReadSettingsFile();
-    if (domain == nil) {
-        os_log(TweakLog(), "settings file unreadable");
-        return;
-    }
-    APLApplyState(APLBoolInDomain(domain, @"enabled", YES),
-                  APLBoolInDomain(domain, APLKeyForBundle(sBundleID), NO));
+    APLApplyDomain(APLReadSettingsFile());
 }
 
 // The pane writes through cfprefsd, which flushes the file a moment after it
@@ -412,15 +512,6 @@ static void APLReapplyAfterChanges(const double *delays, size_t count) {
     }
 }
 
-static void APLStartListeningForChanges(void) {
-    static int token;
-    notify_register_dispatch(APLChangedNotificationName().UTF8String, &token, dispatch_get_main_queue(), ^(int __unused note) {
-        os_log(TweakLog(), "settings changed, reloading");
-        static const double delays[] = {0.5, 2.0};
-        APLReapplyAfterChanges(delays, sizeof(delays) / sizeof(delays[0]));
-    });
-}
-
 static void APLInstallObservers(void) {
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
 
@@ -428,7 +519,20 @@ static void APLInstallObservers(void) {
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *__unused note) {
-        if (!sEnabled || !sProtected || !sLocked) {
+        if (!sEnabled || !sProtected) {
+            return;
+        }
+        // Back from the background: lock once the chosen wait has passed.
+        if (!sLocked && sBackgroundDate != nil && sLockDelay > 0) {
+            NSTimeInterval away = -[sBackgroundDate timeIntervalSinceNow];
+            if (away >= (NSTimeInterval)sLockDelay) {
+                os_log(TweakLog(), "away %.0fs, locking", away);
+                sLocked = YES;
+                sPrompted = NO;
+            }
+        }
+        sBackgroundDate = nil;
+        if (!sLocked) {
             return;
         }
         APLShowLock();
@@ -436,8 +540,8 @@ static void APLInstallObservers(void) {
         APLPromptIfNeeded();
     }];
 
-    // Lock again as the app leaves, so the app switcher shows the lock screen
-    // rather than the app's content.
+    // Leaving the app: with an immediate lock the app switcher shows the lock
+    // screen rather than the app's content; otherwise leave it and time it.
     [center addObserverForName:UIApplicationDidEnterBackgroundNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
@@ -445,6 +549,23 @@ static void APLInstallObservers(void) {
         if (!sEnabled || !sProtected) {
             return;
         }
+        sBackgroundDate = [NSDate date];
+        if (sLockDelay == 0) {
+            sLocked = YES;
+            sPrompted = NO;
+            APLShowLock();
+        }
+    }];
+
+    // The device locked (the passcode-protected data went away): lock too.
+    [center addObserverForName:UIApplicationProtectedDataWillBecomeUnavailable
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *__unused note) {
+        if (!sEnabled || !sProtected || !sLockOnDeviceLock) {
+            return;
+        }
+        os_log(TweakLog(), "device locked, locking app");
         sLocked = YES;
         sPrompted = NO;
         APLShowLock();
@@ -460,7 +581,16 @@ static void APLInstallObservers(void) {
     }];
 }
 
-#pragma mark - Hooking the app's launch
+static void APLStartListeningForChanges(void) {
+    static int token;
+    notify_register_dispatch(APLChangedNotificationName().UTF8String, &token, dispatch_get_main_queue(), ^(int __unused note) {
+        os_log(TweakLog(), "settings changed, reloading");
+        static const double delays[] = {0.5, 2.0};
+        APLReapplyAfterChanges(delays, sizeof(delays) / sizeof(delays[0]));
+    });
+}
+
+#pragma mark - The app
 
 static void APLPrepareForHost(void) {
     if (sPrepared) {
@@ -469,8 +599,12 @@ static void APLPrepareForHost(void) {
     sPrepared = YES;
 
     NSString *bundleID = [NSBundle mainBundle].bundleIdentifier;
-    if (bundleID.length == 0 || [bundleID isEqualToString:@"com.apple.springboard"]) {
-        return;  // Not an app the pane could list.
+    NSString *bundlePath = [NSBundle mainBundle].bundlePath ?: @"";
+    BOOL isApp = [bundlePath hasPrefix:@"/private/var/containers/Bundle/Application/"] ||
+                 [bundlePath hasPrefix:@"/var/containers/Bundle/Application/"] ||
+                 [bundlePath containsString:@"/Applications/"];
+    if (bundleID.length == 0 || !isApp) {
+        return;  // System UI and extension processes are not apps the pane lists.
     }
     sBundleID = bundleID;
     sAppName = APLHostDisplayName();
@@ -488,12 +622,137 @@ static void APLPrepareForHost(void) {
     });
 }
 
+#pragma mark - SpringBoard: the Face ID service
+
+// Launch Services is private: declare only what is sent to it, so the class is
+// reached by name at run time.
+@interface APLLaunchServicesProxy : NSObject
++ (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
+- (NSString *)localizedName;
+@end
+
+// SpringBoard's entitlements carry kTCCServiceFaceID, so the biometric prompt
+// has to be asked for from here; the app tells this service which protected
+// app is waiting, over the Darwin names in Protect.h.
+static NSMutableDictionary<NSString *, NSNumber *> *sAuthListeners;
+
+static NSString *APLDisplayNameForBundle(NSString *bundleID) {
+    Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+    if (proxyClass != Nil) {
+        id proxy = [(id)proxyClass applicationProxyForIdentifier:bundleID];
+        if (proxy != nil) {
+            NSString *name = [proxy localizedName];
+            if (name.length > 0) {
+                return name;
+            }
+        }
+    }
+    return bundleID;
+}
+
+static void APLPublishAuthResult(NSString *bundleID, uint32_t token, BOOL granted) {
+    NSString *name = APLAuthResultName(bundleID);
+    int handle = 0;
+    if (notify_register_check(name.UTF8String, &handle) != NOTIFY_STATUS_OK) {
+        os_log(TweakLog(), "cannot publish Face ID answer for %{public}s", bundleID.UTF8String);
+        return;
+    }
+    notify_set_state(handle, ((uint64_t)token << 1) | (granted ? 1 : 0));
+    notify_post(name.UTF8String);
+    notify_cancel(handle);
+}
+
+static void APLHandleAuthRequest(NSString *bundleID, int handle) {
+    uint64_t state = 0;
+    if (notify_get_state(handle, &state) != NOTIFY_STATUS_OK) {
+        return;
+    }
+    uint32_t token = (uint32_t)state;
+    os_log(TweakLog(), "Face ID requested by %{public}s", bundleID.UTF8String);
+
+    LAContext *context = [[LAContext alloc] init];
+    context.localizedCancelTitle = @"取消";
+    NSString *reason = [NSString stringWithFormat:@"解锁“%@”", APLDisplayNameForBundle(bundleID)];
+    __block BOOL answered = NO;
+    [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
+            localizedReason:reason
+                      reply:^(BOOL success, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (answered) {
+                return;
+            }
+            answered = YES;
+            os_log(TweakLog(), "Face ID for %{public}s success=%d error=%{public}s",
+                   bundleID.UTF8String, (int)success, error.localizedDescription.UTF8String ?: "(none)");
+            APLPublishAuthResult(bundleID, token, success);
+        });
+    }];
+}
+
+static void APLRefreshAuthListeners(void) {
+    if (sAuthListeners == nil) {
+        sAuthListeners = [NSMutableDictionary dictionary];
+    }
+    NSArray<NSString *> *protectedBundleIDs = APLProtectedBundleIDsInDomain(APLReadSettingsFile());
+    os_log(TweakLog(), "auth service watching %lu protected app(s)", (unsigned long)protectedBundleIDs.count);
+    os_log(TweakLog(), "watched: %{public}s", [[protectedBundleIDs componentsJoinedByString:@","] UTF8String]);
+
+    for (NSString *bundleID in [sAuthListeners allKeys]) {
+        if (![protectedBundleIDs containsObject:bundleID]) {
+            notify_cancel([sAuthListeners[bundleID] intValue]);
+            [sAuthListeners removeObjectForKey:bundleID];
+        }
+    }
+    for (NSString *bundleID in protectedBundleIDs) {
+        if (sAuthListeners[bundleID] != nil) {
+            continue;
+        }
+        int handle = 0;
+        NSString *name = APLAuthRequestName(bundleID);
+        notify_register_dispatch(name.UTF8String, &handle, dispatch_get_main_queue(), ^(int stateHandle) {
+            APLHandleAuthRequest(bundleID, stateHandle);
+        });
+        sAuthListeners[bundleID] = @(handle);
+    }
+
+    // The handle stays registered: notifyd drops a name's state once nothing
+    // holds the name, and the lock screen reads that state to know this
+    // service is up.
+    static int serviceHandle;
+    if (serviceHandle == 0 && notify_register_check(APLAuthServiceName().UTF8String, &serviceHandle) != NOTIFY_STATUS_OK) {
+        os_log(TweakLog(), "cannot publish the auth service");
+        serviceHandle = 0;
+        return;
+    }
+    notify_set_state(serviceHandle, 1);
+    notify_post(APLAuthServiceName().UTF8String);
+}
+
+static void APLSetupSpringBoardService(void) {
+    static int changeToken;
+    APLRefreshAuthListeners();
+    notify_register_dispatch(APLChangedNotificationName().UTF8String, &changeToken, dispatch_get_main_queue(), ^(int __unused note) {
+        os_log(TweakLog(), "settings changed, refreshing the auth service");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            APLRefreshAuthListeners();
+        });
+    });
+}
+
+#pragma mark - Hooking the app's launch
+
 static void (*OriginalRun)(id self, SEL _cmd);
 
 // -[UIApplication _run] is where UIApplicationMain settles before the app's
 // own launch callbacks, so the lock is up before the app draws anything.
+static BOOL APLIsSpringBoard(void) {
+    return [[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.springboard"];
+}
+
 static void HookedRun(id self, SEL _cmd) {
-    APLPrepareForHost();
+    if (!APLIsSpringBoard()) {
+        APLPrepareForHost();
+    }
     if (OriginalRun != NULL) {
         OriginalRun(self, _cmd);
     }
@@ -503,6 +762,15 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     // Apelin's confirm_loaded looks for this exact marker and build id under
     // the package id's subsystem. Keep the line, and keep it public.
     os_log(TweakLog(), "ApelinLoaded %{public}s in %{public}s", APELIN_BUILD_ID, getprogname());
+
+    // SpringBoard may never run -[UIApplication _run], so its auth service
+    // starts from here, on the main queue once its run loop is going.
+    if (APLIsSpringBoard()) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            APLSetupSpringBoardService();
+        });
+        return;
+    }
 
     Class applicationClass = objc_getClass("UIApplication");
     if (applicationClass == Nil) {

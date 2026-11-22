@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-// The Settings pane. Root.plist carries the master switch; the rows below it
-// are one switch per installed app, built here from Launch Services. Each row
-// stores `protected.<bundle id>` in the package's own preferences domain and
-// posts `<package id>/changed`, which is exactly what the tweak reads inside
-// the app.
+// The Settings pane. It carries the master switch, how long the app stays
+// unlocked in the background, whether the device locking locks the app, and
+// one switch per installed app (with a search field over the list). Each row
+// stores its value in the package's own preferences domain and posts
+// `<package id>/changed`, which is exactly what the tweak reads inside the app.
 
 #import <Preferences/PSListController.h>
 #import <UIKit/UIKit.h>
@@ -30,10 +30,24 @@
 + (UIImage *)_applicationIconImageForBundleIdentifier:(NSString *)bundleID format:(int)format scale:(CGFloat)scale;
 @end
 
-@interface FaceLockPrefsRootListController : PSListController
+@interface FaceLockPrefsRootListController : PSListController <UISearchResultsUpdating>
 @end
 
-@implementation FaceLockPrefsRootListController
+@implementation FaceLockPrefsRootListController {
+    NSMutableArray<PSSpecifier *> *_appSpecifiers;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+
+    UISearchController *search = [[UISearchController alloc] initWithSearchResultsController:nil];
+    search.searchResultsUpdater = self;
+    search.obscuresBackgroundDuringPresentation = NO;
+    search.searchBar.placeholder = @"搜索 App";
+    self.navigationItem.searchController = search;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    self.definesPresentationContext = YES;
+}
 
 - (NSArray *)specifiers {
     if (_specifiers == nil) {
@@ -48,22 +62,36 @@
     NSString *notification = APLChangedNotificationName();
 
     PSSpecifier *intro = [PSSpecifier groupSpecifierWithName:@"面容锁"];
-    [intro setProperty:@"打开受保护的 App 时需要面容 ID 验证，验证不通过就无法继续使用。App 退到后台后会重新上锁。"
-                forKey:@"footerText"];
+    [intro setProperty:@"打开受保护的 App 时需要面容 ID 验证，验证不通过就无法继续使用。" forKey:@"footerText"];
     [specifiers addObject:intro];
 
-    PSSpecifier *master = [PSSpecifier preferenceSpecifierNamed:@"启用保护"
-                                                         target:self
-                                                            set:@selector(setPreferenceValue:specifier:)
-                                                            get:@selector(readPreferenceValue:)
-                                                         detail:nil
-                                                           cell:PSSwitchCell
-                                                           edit:nil];
-    [master setProperty:@"enabled" forKey:@"key"];
-    [master setProperty:domain forKey:@"defaults"];
+    PSSpecifier *master = [self valueRowNamed:@"启用保护" key:APLKeyForEnabled() domain:domain notification:notification];
     [master setProperty:@YES forKey:@"default"];
-    [master setProperty:notification forKey:@"PostNotification"];
     [specifiers addObject:master];
+
+    PSSpecifier *timing = [PSSpecifier groupSpecifierWithName:@"锁定时机"];
+    [timing setProperty:@"每次打开 App 都会验证一次。退到后台超过设定时间再回来、或设备锁屏时，也会重新验证。"
+                 forKey:@"footerText"];
+    [specifiers addObject:timing];
+
+    PSSpecifier *delay = [PSSpecifier preferenceSpecifierNamed:@"后台锁定时机"
+                                                        target:self
+                                                           set:@selector(setPreferenceValue:specifier:)
+                                                           get:@selector(readPreferenceValue:)
+                                                        detail:nil
+                                                          cell:PSLinkListCell
+                                                          edit:nil];
+    [delay setProperty:APLKeyForLockDelay() forKey:@"key"];
+    [delay setProperty:domain forKey:@"defaults"];
+    [delay setProperty:@0 forKey:@"default"];
+    [delay setProperty:@[@-1, @0, @30, @60, @300, @600] forKey:@"values"];
+    [delay setProperty:@[@"不锁定", @"立即", @"30 秒后", @"1 分钟后", @"5 分钟后", @"10 分钟后"] forKey:@"titles"];
+    [delay setProperty:notification forKey:@"PostNotification"];
+    [specifiers addObject:delay];
+
+    PSSpecifier *deviceLock = [self valueRowNamed:@"设备锁屏时锁定" key:APLKeyForLockOnDeviceLock() domain:domain notification:notification];
+    [deviceLock setProperty:@YES forKey:@"default"];
+    [specifiers addObject:deviceLock];
 
     [specifiers addObjectsFromArray:[self appSpecifiers]];
     return specifiers;
@@ -71,13 +99,31 @@
 
 #pragma mark - Rows
 
+- (PSSpecifier *)valueRowNamed:(NSString *)name key:(NSString *)key domain:(NSString *)domain notification:(NSString *)notification {
+    PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:name
+                                                            target:self
+                                                               set:@selector(setPreferenceValue:specifier:)
+                                                               get:@selector(readPreferenceValue:)
+                                                            detail:nil
+                                                              cell:PSSwitchCell
+                                                              edit:nil];
+    [specifier setProperty:key forKey:@"key"];
+    [specifier setProperty:domain forKey:@"defaults"];
+    [specifier setProperty:notification forKey:@"PostNotification"];
+    return specifier;
+}
+
 - (NSArray *)appSpecifiers {
     NSMutableArray *specifiers = [NSMutableArray array];
+    if (_appSpecifiers == nil) {
+        _appSpecifiers = [NSMutableArray array];
+    }
+    [_appSpecifiers removeAllObjects];
 
     PSSpecifier *header = [PSSpecifier groupSpecifierWithName:@"已保护的 App"];
     NSArray *apps = [self installedApps];
     [header setProperty:(apps.count > 0
-                         ? [NSString stringWithFormat:@"共 %lu 个 App。打开受保护的 App 时需要面容 ID 验证，验证不通过就无法继续使用。", (unsigned long)apps.count]
+                         ? [NSString stringWithFormat:@"共 %lu 个 App，打开开关即受面容 ID 保护。", (unsigned long)apps.count]
                          : @"读取不到已安装的 App 列表，请重新打开设置页。")
                  forKey:@"footerText"];
     [specifiers addObject:header];
@@ -89,26 +135,43 @@
         NSString *bundleID = app.bundleIdentifier;
         NSString *name = app.localizedName.length ? app.localizedName : bundleID;
 
-        PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:name
-                                                               target:self
-                                                                  set:@selector(setPreferenceValue:specifier:)
-                                                                  get:@selector(readPreferenceValue:)
-                                                               detail:nil
-                                                                 cell:PSSwitchCell
-                                                                 edit:nil];
+        PSSpecifier *specifier = [self valueRowNamed:name key:APLKeyForBundle(bundleID) domain:domain notification:notification];
         [specifier setProperty:bundleID forKey:@"id"];
-        [specifier setProperty:APLKeyForBundle(bundleID) forKey:@"key"];
-        [specifier setProperty:domain forKey:@"defaults"];
         [specifier setProperty:@NO forKey:@"default"];
-        [specifier setProperty:notification forKey:@"PostNotification"];
         UIImage *icon = [self iconForBundleID:bundleID];
         if (icon != nil) {
             [specifier setProperty:icon forKey:@"iconImage"];
         }
         [specifiers addObject:specifier];
+        [_appSpecifiers addObject:specifier];
     }
     return specifiers;
 }
+
+#pragma mark - Search
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
+    NSString *query = [[[searchController.searchBar.text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString] copy];
+    NSArray *visible = [[self specifiers] copy];
+    for (PSSpecifier *specifier in _appSpecifiers) {
+        if ([visible containsObject:specifier]) {
+            [self removeSpecifier:specifier animated:NO];
+        }
+    }
+    NSInteger index = (NSInteger)[[self specifiers] count];
+    for (PSSpecifier *specifier in _appSpecifiers) {
+        NSString *name = [[specifier name] lowercaseString];
+        NSString *bundleID = [[specifier propertyForKey:@"id"] lowercaseString] ?: @"";
+        BOOL matches = query.length == 0 || [name containsString:query] || [bundleID containsString:query];
+        if (!matches) {
+            continue;
+        }
+        [self insertSpecifier:specifier atIndex:index animated:NO];
+        index++;
+    }
+}
+
+#pragma mark - Icons
 
 - (UIImage *)iconForBundleID:(NSString *)bundleID {
     SEL selector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
