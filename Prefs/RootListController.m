@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-// The Settings pane. Root.plist carries the fixed rows — the master switch, the
-// background lock delay (Preferences' own value picker) and the device-lock
-// switch — so they look and behave like the rest of Settings. Below them this
-// controller adds one switch per installed app, over a search field.
+// The Settings pane. Root.plist carries the fixed switches and section text, so
+// those rows look and behave like the rest of Settings. Between them this
+// controller puts the background-lock delay row, which opens a page of its own
+// (Preferences' own value picker drew nothing on this iOS build), and below
+// them one switch per installed app, over a search field.
 // Every row stores into the package's own preferences domain and posts
 // `<package id>/changed`, which is exactly what the tweak reads inside the app.
 
@@ -32,6 +33,94 @@
 + (UIImage *)_applicationIconImageForBundleIdentifier:(NSString *)bundleID format:(int)format scale:(CGFloat)scale;
 @end
 
+#pragma mark - The delay's own page
+
+/// The choices the 后台锁定时机 row offers, in seconds (-1: never).
+static NSArray<NSNumber *> *APLLockDelayValues(void) {
+    return @[@0, @30, @60, @300, @600, @-1];
+}
+
+static NSArray<NSString *> *APLLockDelayTitles(void) {
+    return @[@"立即", @"30 秒后", @"1 分钟后", @"5 分钟后", @"10 分钟后", @"不锁定"];
+}
+
+static NSInteger APLIntegerPreference(NSString *key, NSInteger fallback) {
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
+                                                        (__bridge CFStringRef)APLPreferencesDomain());
+    if (value == NULL) {
+        return fallback;
+    }
+    NSInteger result = fallback;
+    if (CFGetTypeID(value) == CFNumberGetTypeID() || CFGetTypeID(value) == CFBooleanGetTypeID()) {
+        result = [(__bridge NSNumber *)value integerValue];
+    }
+    CFRelease(value);
+    return result;
+}
+
+static void APLSetIntegerPreference(NSString *key, NSInteger value) {
+    CFPreferencesSetAppValue((__bridge CFStringRef)key,
+                             (__bridge CFTypeRef)@(value),
+                             (__bridge CFStringRef)APLPreferencesDomain());
+    CFPreferencesAppSynchronize((__bridge CFStringRef)APLPreferencesDomain());
+    notify_post(APLChangedNotificationName().UTF8String);
+}
+
+@interface FaceLockDelayListController : PSViewController <UITableViewDataSource, UITableViewDelegate>
+@end
+
+@implementation FaceLockDelayListController {
+    UITableView *_tableView;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"后台锁定时机";
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
+
+    _tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    _tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:_tableView];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return (NSInteger)APLLockDelayTitles().count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *identifier = @"FaceLockDelayCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:identifier];
+    if (cell == nil) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        cell.textLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        cell.textLabel.textColor = [UIColor labelColor];
+    }
+    NSArray<NSNumber *> *values = APLLockDelayValues();
+    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
+    cell.textLabel.text = APLLockDelayTitles()[indexPath.row];
+    BOOL selected = indexPath.row < (NSInteger)values.count && values[indexPath.row].integerValue == current;
+    cell.accessoryType = selected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSArray<NSNumber *> *values = APLLockDelayValues();
+    if (indexPath.row < (NSInteger)values.count) {
+        APLSetIntegerPreference(APLKeyForLockDelay(), values[indexPath.row].integerValue);
+    }
+    [tableView reloadData];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self.navigationController popViewControllerAnimated:YES];
+    });
+}
+
+@end
+
+#pragma mark - The pane
+
 @interface FaceLockPrefsRootListController : PSListController <UISearchResultsUpdating>
 @end
 
@@ -56,6 +145,23 @@
 - (NSArray *)specifiers {
     if (_specifiers == nil) {
         NSMutableArray *specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+
+        PSSpecifier *delay = [PSSpecifier preferenceSpecifierNamed:@"后台锁定时机"
+                                                            target:self
+                                                               set:nil
+                                                               get:nil
+                                                            detail:[FaceLockDelayListController class]
+                                                              cell:PSLinkCell
+                                                              edit:nil];
+        NSUInteger insertAt = specifiers.count;
+        for (NSUInteger index = 0; index < specifiers.count; index++) {
+            if ([[specifiers[index] identifier] isEqualToString:@"deviceLock"]) {
+                insertAt = index;
+                break;
+            }
+        }
+        [specifiers insertObject:delay atIndex:insertAt];
+
         [specifiers addObjectsFromArray:[self appSpecifiers]];
         _specifiers = specifiers;
     }

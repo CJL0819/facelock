@@ -44,39 +44,9 @@
 		</dict>
 		<dict>
 			<key>cell</key>
-			<string>PSLinkListCell</string>
-			<key>label</key>
-			<string>后台锁定时机</string>
-			<key>key</key>
-			<string>backgroundLockDelay</string>
-			<key>default</key>
-			<integer>0</integer>
-			<key>defaults</key>
-			<string>com.404.facelock</string>
-			<key>PostNotification</key>
-			<string>com.404.facelock/changed</string>
-			<key>values</key>
-			<array>
-				<integer>0</integer>
-				<integer>30</integer>
-				<integer>60</integer>
-				<integer>300</integer>
-				<integer>600</integer>
-				<integer>-1</integer>
-			</array>
-			<key>titles</key>
-			<array>
-				<string>立即</string>
-				<string>30 秒后</string>
-				<string>1 分钟后</string>
-				<string>5 分钟后</string>
-				<string>10 分钟后</string>
-				<string>不锁定</string>
-			</array>
-		</dict>
-		<dict>
-			<key>cell</key>
 			<string>PSSwitchCell</string>
+			<key>id</key>
+			<string>deviceLock</string>
 			<key>label</key>
 			<string>设备锁屏时锁定</string>
 			<key>key</key>
