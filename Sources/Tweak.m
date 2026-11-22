@@ -77,7 +77,8 @@ static BOOL sAuthAttemptStarted;
 static BOOL sPrepared;
 static BOOL sFirstApply = YES;
 
-static void APLWriteUnlockExpiry(uint64_t expiry);
+static void APLWriteUnlockRecord(uint64_t unlockedAt, uint64_t expiry);
+static void APLClearUnlockRecord(void);
 static uint64_t APLExpiryForCurrentSettings(void);
 static BOOL sLockOnDeviceLock;
 static NSInteger sLockDelay;
@@ -452,7 +453,7 @@ static void APLShowLock(void) {
         controller.onUnlocked = ^{
             sLocked = NO;
             sAuthAttemptStarted = NO;
-            APLWriteUnlockExpiry(APLExpiryForCurrentSettings());
+            APLWriteUnlockRecord((uint64_t)[NSDate date].timeIntervalSince1970, APLExpiryForCurrentSettings());
             os_log(TweakLog(), "unlocked %{public}s", sBundleID.UTF8String ?: "");
             if (sLockWindow == nil) {
                 return;
@@ -589,21 +590,49 @@ static NSString *APLUnlockRecordPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/com.404.facelock.unlock"];
 }
 
-static uint64_t APLUnlockExpiry(void) {
-    NSString *text = [NSString stringWithContentsOfFile:APLUnlockRecordPath() encoding:NSUTF8StringEncoding error:NULL];
-    if (text == nil) {
+static uint64_t APLDeviceLockStamp(void) {
+    int handle = 0;
+    if (notify_register_check(APLDeviceLockStampName().UTF8String, &handle) != NOTIFY_STATUS_OK) {
         return 0;
     }
-    return strtoull(text.UTF8String, NULL, 10);
+    uint64_t state = 0;
+    notify_get_state(handle, &state);
+    notify_cancel(handle);
+    return state;
 }
 
-static void APLWriteUnlockExpiry(uint64_t expiry) {
-    NSString *path = APLUnlockRecordPath();
+static void APLClearUnlockRecord(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:APLUnlockRecordPath() error:NULL];
+}
+
+// "<unlocked at> <valid until>": the first number lets a launch tell whether a
+// device lock happened since, even one this app slept through.
+static void APLWriteUnlockRecord(uint64_t unlockedAt, uint64_t expiry) {
     if (expiry == 0) {
-        [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+        APLClearUnlockRecord();
         return;
     }
-    [[NSString stringWithFormat:@"%llu", expiry] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    NSString *text = [NSString stringWithFormat:@"%llu %llu", unlockedAt, expiry];
+    [text writeToFile:APLUnlockRecordPath() atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+}
+
+static BOOL APLReadUnlockRecord(uint64_t *unlockedAt, uint64_t *expiry) {
+    NSString *text = [NSString stringWithContentsOfFile:APLUnlockRecordPath() encoding:NSUTF8StringEncoding error:NULL];
+    if (text == nil) {
+        return NO;
+    }
+    unsigned long long unlocked = 0;
+    unsigned long long until = 0;
+    if (sscanf(text.UTF8String, "%llu %llu", &unlocked, &until) != 2) {
+        return NO;
+    }
+    if (unlockedAt != NULL) {
+        *unlockedAt = (uint64_t)unlocked;
+    }
+    if (expiry != NULL) {
+        *expiry = (uint64_t)until;
+    }
+    return YES;
 }
 
 // When the app was unlocked, how long that holds: 0 for the immediate lock
@@ -619,8 +648,14 @@ static uint64_t APLExpiryForCurrentSettings(void) {
 }
 
 static BOOL APLUnlockRecordStillHolds(void) {
-    uint64_t expiry = APLUnlockExpiry();
-    if (expiry == 0) {
+    uint64_t unlockedAt = 0;
+    uint64_t expiry = 0;
+    if (!APLReadUnlockRecord(&unlockedAt, &expiry) || expiry == 0) {
+        return NO;
+    }
+    uint64_t locked = APLDeviceLockStamp();
+    if (locked > unlockedAt) {
+        os_log(TweakLog(), "the device locked since that unlock");
         return NO;
     }
     if (expiry >= APLUnlockNeverExpires) {
@@ -644,7 +679,7 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
            (int)sEnabled, (int)sProtected, (long)sLockDelay, (int)sLockOnDeviceLock);
 
     if (!(sEnabled && sProtected)) {
-        APLWriteUnlockExpiry(0);
+        APLClearUnlockRecord();
         if (sLocked) {
             sLocked = NO;
             sAuthAttemptStarted = NO;
@@ -660,8 +695,12 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
         if (recordHolds && sLockDelay == 0) {
             recordHolds = NO;  // "立即": every launch asks
         }
-        if (recordHolds && sLockDelay > 0 && APLUnlockExpiry() >= APLUnlockNeverExpires) {
-            recordHolds = NO;  // written while the delay was off, now it is on
+        if (recordHolds && sLockDelay > 0) {
+            uint64_t unlockedAt = 0;
+            uint64_t expiry = 0;
+            if (APLReadUnlockRecord(&unlockedAt, &expiry) && expiry >= APLUnlockNeverExpires) {
+                recordHolds = NO;  // written while the delay was off, now it is on
+            }
         }
         if (recordHolds) {
             os_log(TweakLog(), "still unlocked from an earlier session");
@@ -773,7 +812,7 @@ static void APLInstallObservers(void) {
             return;
         }
         os_log(TweakLog(), "device locked, locking app");
-        APLWriteUnlockExpiry(0);  // the device lock ends the app's grace period
+        APLClearUnlockRecord();  // the device lock ends the app's grace period
         APLLockApp();
     }];
 
@@ -1019,6 +1058,20 @@ static void APLRefreshAuthListeners(void) {
     notify_post(APLAuthServiceName().UTF8String);
 }
 
+// SpringBoard runs from boot to shutdown, so its stamp of the last device lock
+// is what a suspended or killed app can still be held to.
+static void APLPublishDeviceLockStamp(void) {
+    static int handle;
+    if (handle == 0 && notify_register_check(APLDeviceLockStampName().UTF8String, &handle) != NOTIFY_STATUS_OK) {
+        os_log(TweakLog(), "cannot publish the device lock stamp");
+        handle = 0;
+        return;
+    }
+    notify_set_state(handle, (uint64_t)[NSDate date].timeIntervalSince1970);
+    notify_post(APLDeviceLockStampName().UTF8String);
+    os_log(TweakLog(), "device lock stamped");
+}
+
 static void APLSetupSpringBoardService(void) {
     static int changeToken;
     APLRefreshAuthListeners();
@@ -1031,6 +1084,19 @@ static void APLSetupSpringBoardService(void) {
             APLRefreshAuthListeners();
         });
     });
+
+    // SpringBoard's own lock notifications, plus the one UIKit posts when the
+    // passcode-protected data goes away.
+    static int lockToken;
+    notify_register_dispatch("com.apple.springboard.lockcomplete", &lockToken, dispatch_get_main_queue(), ^(int __unused note) {
+        APLPublishDeviceLockStamp();
+    });
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationProtectedDataWillBecomeUnavailable
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *__unused note) {
+        APLPublishDeviceLockStamp();
+    }];
 }
 
 #pragma mark - Hooking the app's launch

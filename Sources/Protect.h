@@ -76,6 +76,12 @@ static inline NSString *APLProtectionStateName(NSString *bundleID) {
     return [NSString stringWithFormat:@"%@/protected/%@", APLPreferencesDomain(), bundleID];
 }
 
+/// SpringBoard stamps the moment the device locked here; an app compares it
+/// with when it unlocked, so a lock while it was suspended still counts.
+static inline NSString *APLDeviceLockStampName(void) {
+    return [APLPreferencesDomain() stringByAppendingString:@"/devicelock"];
+}
+
 /// SpringBoard's auth service publishes 1 here once it is listening, so a lock
 /// screen can tell "not ready" from "Face ID failed".
 static inline NSString *APLAuthServiceName(void) {
