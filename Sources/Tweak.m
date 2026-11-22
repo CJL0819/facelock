@@ -833,9 +833,9 @@ static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
     }];
 
     // iOS keeps its sheet up after a failed match, with its own retry inside it.
-    // This gives one attempt a life of its own: when nothing comes back in five
+    // This gives one attempt a life of its own: when nothing comes back in three
     // seconds, close the sheet and answer, so the lock screen opens a fresh one.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (sAuthContexts[bundleID] != context) {
             return;  // answered, or replaced by a newer request
         }
