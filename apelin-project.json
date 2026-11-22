@@ -163,7 +163,7 @@
   "package": {
     "id": "com.404.facelock",
     "name": "应用面容锁",
-    "version": "0.0.23",
+    "version": "1.0.0",
     "description": "为选定的 App 加上面容 ID 锁。",
     "icon": "https://raw.githubusercontent.com/CJL0819/facelock/main/apelin-icon.png",
     "author": "404",
