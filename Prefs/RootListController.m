@@ -21,6 +21,7 @@
 @property (nonatomic, readonly) NSString *bundleIdentifier;
 @property (nonatomic, readonly) NSString *localizedName;
 @property (nonatomic, readonly) NSString *applicationType;
+@property (nonatomic, readonly) NSArray *appTags;
 @property (nonatomic, readonly, getter=isHidden) BOOL hidden;
 @end
 
@@ -298,9 +299,10 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     return workspace;
 }
 
-/// The apps a person can open: App Store, TrollStore, sideloaded ones and the
-/// system apps they may still want behind Face ID. Hidden apps, web clips and
-/// the like stay out.
+/// The apps a person can see on the Home Screen: anything SpringBoard shows an
+/// icon for, plus whatever they installed themselves. Apps that only live
+/// lower in the system (hidden apps, web clips, placeholders, internal
+/// bundles) stay out.
 - (NSArray *)installedApps {
     id workspace = [self workspace];
     if (workspace == nil || ![workspace respondsToSelector:@selector(allInstalledApplications)]) {
@@ -321,12 +323,31 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
         if (bundleID.length == 0 || [bundleID isEqualToString:@"com.apple.springboard"]) {
             continue;
         }
+
+        // SpringBoard marks the apps it puts on a Home Screen as "visible".
+        NSArray *tags = nil;
+        if ([app respondsToSelector:@selector(appTags)]) {
+            tags = app.appTags;
+        }
+        if (![tags isKindOfClass:[NSArray class]]) {
+            tags = nil;
+        }
+        if ([tags containsObject:@"hidden"]) {
+            continue;
+        }
+
+        NSString *type = nil;
         if ([app respondsToSelector:@selector(applicationType)]) {
-            NSString *type = app.applicationType;
-            if (type.length > 0 && ![type isEqualToString:@"User"] && ![type isEqualToString:@"System"]) {
-                continue;  // Web clips, placeholders and internal bundles.
+            type = app.applicationType;
+        }
+        BOOL userInstalled = [type isEqualToString:@"User"];
+        BOOL onHomeScreen = [tags containsObject:@"visible"];
+        if (tags != nil || type.length > 0) {
+            if (!userInstalled && !onHomeScreen) {
+                continue;  // Internal bundles, web clips, placeholders.
             }
         }
+
         if ([app respondsToSelector:@selector(isHidden)] && app.isHidden) {
             continue;
         }
