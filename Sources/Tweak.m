@@ -420,7 +420,12 @@ static void APLAttachLockWindow(UIWindowScene *scene) {
     if (sLockWindow.windowScene != scene) {
         sLockWindow.windowScene = scene;
     }
-    sLockWindow.frame = scene.coordinateSpace.bounds;
+    // A few points of overdraw: the scene's bounds can shift by a hair while a
+    // system sheet animates in, and a window that matches it exactly then shows
+    // the app's own colour as a sliver along the top corners.
+    CGRect bounds = scene.coordinateSpace.bounds;
+    sLockWindow.frame = CGRectMake(bounds.origin.x - 6.0, bounds.origin.y - 6.0,
+                                   bounds.size.width + 12.0, bounds.size.height + 12.0);
     sLockWindow.hidden = NO;
 }
 
@@ -458,13 +463,10 @@ static void APLShowLock(void) {
             if (sLockWindow == nil) {
                 return;
             }
-            [UIView animateWithDuration:0.2
-                             animations:^{
-                sLockWindow.alpha = 0.0;
-            } completion:^(BOOL __unused finished) {
-                sLockWindow.hidden = YES;
-                sLockWindow.alpha = 1.0;
-            }];
+            // Hide at once: a fade lets the app's own background show through,
+            // which reads as a flash at the screen's rounded corners.
+            sLockWindow.hidden = YES;
+            sLockWindow.alpha = 1.0;
         };
         sLockWindow.rootViewController = controller;
         sLockController = controller;
