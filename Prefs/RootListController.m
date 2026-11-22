@@ -65,38 +65,41 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     notify_post(APLChangedNotificationName().UTF8String);
 }
 
-@interface FaceLockDelayListController : PSListController
+@interface FaceLockDelayListController : PSViewController <UITableViewDataSource, UITableViewDelegate>
 @end
 
-@implementation FaceLockDelayListController
+@implementation FaceLockDelayListController {
+    UITableView *_tableView;
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"后台锁定时机";
+
+    _tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    _tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:_tableView];
 }
 
-- (NSArray *)specifiers {
-    if (_specifiers == nil) {
-        NSMutableArray *specifiers = [NSMutableArray array];
-        NSArray<NSNumber *> *values = APLLockDelayValues();
-        NSArray<NSString *> *titles = APLLockDelayTitles();
-        NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
-        for (NSUInteger index = 0; index < titles.count; index++) {
-            BOOL selected = index < values.count && values[index].integerValue == current;
-            PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:titles[index]
-                                                                    target:self
-                                                                       set:nil
-                                                                       get:nil
-                                                                    detail:nil
-                                                                      cell:PSListItemCell
-                                                                      edit:nil];
-            // A row's value is drawn at its right edge.
-            [specifier setProperty:(selected ? @"✓" : @"") forKey:@"value"];
-            [specifiers addObject:specifier];
-        }
-        _specifiers = specifiers;
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return (NSInteger)APLLockDelayTitles().count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *identifier = @"FaceLockDelayCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:identifier];
+    if (cell == nil) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        cell.textLabel.font = [UIFont systemFontOfSize:17.0];
     }
-    return _specifiers;
+    NSArray<NSNumber *> *values = APLLockDelayValues();
+    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
+    cell.textLabel.text = APLLockDelayTitles()[indexPath.row];
+    BOOL selected = indexPath.row < (NSInteger)values.count && values[indexPath.row].integerValue == current;
+    cell.accessoryType = selected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -105,6 +108,7 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     if (indexPath.row < (NSInteger)values.count) {
         APLSetIntegerPreference(APLKeyForLockDelay(), values[indexPath.row].integerValue);
     }
+    [tableView reloadData];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self.navigationController popViewControllerAnimated:YES];
     });
