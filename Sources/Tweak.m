@@ -334,14 +334,8 @@ static UIWindowScene *APLForegroundWindowScene(void) {
     return fallback;
 }
 
-// A window made after iOS 13 shows only once it belongs to a scene; the app's
-// scene may not be connected yet when this runs at launch.
-static void APLPlaceLockWindow(void) {
-    if (sLockWindow == nil) {
-        return;
-    }
-    UIWindowScene *scene = APLForegroundWindowScene();
-    if (scene == nil) {
+static void APLAttachLockWindow(UIWindowScene *scene) {
+    if (sLockWindow == nil || scene == nil) {
         return;
     }
     if (sLockWindow.windowScene != scene) {
@@ -349,6 +343,12 @@ static void APLPlaceLockWindow(void) {
     }
     sLockWindow.frame = scene.coordinateSpace.bounds;
     sLockWindow.hidden = NO;
+}
+
+// A window made after iOS 13 shows only once it belongs to a scene; the app's
+// scene may not be connected yet when this runs at launch.
+static void APLPlaceLockWindow(void) {
+    APLAttachLockWindow(APLForegroundWindowScene());
 }
 
 static void APLHideLockWindow(void) {
@@ -574,6 +574,19 @@ static void APLInstallObservers(void) {
         APLShowLock();
     }];
 
+    [center addObserverForName:UISceneWillConnectNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+        // The app's scene connects before it draws: take it now, so the lock
+        // covers the app from its first frame.
+        if (sLocked && [note.object isKindOfClass:[UIWindowScene class]]) {
+            APLAttachLockWindow((UIWindowScene *)note.object);
+        } else if (sLocked) {
+            APLPlaceLockWindow();
+        }
+    }];
+
     [center addObserverForName:UISceneDidActivateNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
@@ -614,11 +627,13 @@ static void APLPrepareForHost(void) {
 
     APLApplyStateFromFile();
 
-    // The window's scene and the change listener come up once the app's run
-    // loop is going, and the settings file is read once more in case cfprefsd
-    // flushed the pane's last write only after launch.
+    // Observers go in now, on the launch path: the app's scene connects before
+    // it draws, and that is where the lock window has to be attached.
+    APLInstallObservers();
+
+    // The change listener and a second read wait until the run loop is going,
+    // in case cfprefsd flushed the pane's last write only after launch.
     dispatch_async(dispatch_get_main_queue(), ^{
-        APLInstallObservers();
         APLStartListeningForChanges();
         static const double delays[] = {0.8};
         APLReapplyAfterChanges(delays, sizeof(delays) / sizeof(delays[0]));
