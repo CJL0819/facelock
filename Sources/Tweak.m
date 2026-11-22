@@ -75,6 +75,10 @@ static BOOL sProtected;
 static BOOL sLocked;
 static BOOL sAuthAttemptStarted;
 static BOOL sPrepared;
+static BOOL sFirstApply = YES;
+
+static void APLWriteUnlockExpiry(uint64_t expiry);
+static uint64_t APLExpiryForCurrentSettings(void);
 static BOOL sLockOnDeviceLock;
 static NSInteger sLockDelay;
 static NSDate *sBackgroundDate;
@@ -448,6 +452,7 @@ static void APLShowLock(void) {
         controller.onUnlocked = ^{
             sLocked = NO;
             sAuthAttemptStarted = NO;
+            APLWriteUnlockExpiry(APLExpiryForCurrentSettings());
             os_log(TweakLog(), "unlocked %{public}s", sBundleID.UTF8String ?: "");
             if (sLockWindow == nil) {
                 return;
@@ -575,11 +580,62 @@ static NSInteger APLIntegerInDomain(NSDictionary *domain, NSString *key, NSInteg
     return fallback;
 }
 
+// A stamp far in the future stands for "no expiry": the lock delay is off.
+static const uint64_t APLUnlockNeverExpires = 4102444800ULL;  // 2100-01-01
+
+// The app's own container, so the record outlives the process: after iOS kills
+// a backgrounded app, opening it again inside the delay must not ask again.
+static NSString *APLUnlockRecordPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/com.404.facelock.unlock"];
+}
+
+static uint64_t APLUnlockExpiry(void) {
+    NSString *text = [NSString stringWithContentsOfFile:APLUnlockRecordPath() encoding:NSUTF8StringEncoding error:NULL];
+    if (text == nil) {
+        return 0;
+    }
+    return strtoull(text.UTF8String, NULL, 10);
+}
+
+static void APLWriteUnlockExpiry(uint64_t expiry) {
+    NSString *path = APLUnlockRecordPath();
+    if (expiry == 0) {
+        [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+        return;
+    }
+    [[NSString stringWithFormat:@"%llu", expiry] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+}
+
+// When the app was unlocked, how long that holds: 0 for the immediate lock
+// (verify every launch), none for 不锁定, otherwise the chosen wait.
+static uint64_t APLExpiryForCurrentSettings(void) {
+    if (sLockDelay == 0) {
+        return 0;
+    }
+    if (sLockDelay < 0) {
+        return APLUnlockNeverExpires;
+    }
+    return (uint64_t)[NSDate date].timeIntervalSince1970 + (uint64_t)sLockDelay;
+}
+
+static BOOL APLUnlockRecordStillHolds(void) {
+    uint64_t expiry = APLUnlockExpiry();
+    if (expiry == 0) {
+        return NO;
+    }
+    if (expiry >= APLUnlockNeverExpires) {
+        return YES;
+    }
+    return (uint64_t)[NSDate date].timeIntervalSince1970 < expiry;
+}
+
 static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
     if (sBundleID.length == 0) {
         return;
     }
     BOOL wasProtected = sProtected;
+    BOOL firstApply = sFirstApply;
+    sFirstApply = NO;
     sEnabled = enabled;
     sProtected = protected;
     sLockDelay = domain != nil ? APLIntegerInDomain(domain, APLKeyForLockDelay(), 0) : 0;
@@ -588,6 +644,7 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
            (int)sEnabled, (int)sProtected, (long)sLockDelay, (int)sLockOnDeviceLock);
 
     if (!(sEnabled && sProtected)) {
+        APLWriteUnlockExpiry(0);
         if (sLocked) {
             sLocked = NO;
             sAuthAttemptStarted = NO;
@@ -596,7 +653,22 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
         return;
     }
     if (!wasProtected) {
-        // Newly protected, or the launch read: lock before anything is usable.
+        // A launch inside the delay the pane set does not ask again, even if
+        // iOS ended the app in the background since; turning protection on now
+        // always locks.
+        BOOL recordHolds = firstApply && APLUnlockRecordStillHolds();
+        if (recordHolds && sLockDelay == 0) {
+            recordHolds = NO;  // "立即": every launch asks
+        }
+        if (recordHolds && sLockDelay > 0 && APLUnlockExpiry() >= APLUnlockNeverExpires) {
+            recordHolds = NO;  // written while the delay was off, now it is on
+        }
+        if (recordHolds) {
+            os_log(TweakLog(), "still unlocked from an earlier session");
+            sLocked = NO;
+            APLHideLockWindow();
+            return;
+        }
         APLLockApp();
         APLPromptIfNeeded();
         return;
@@ -701,6 +773,7 @@ static void APLInstallObservers(void) {
             return;
         }
         os_log(TweakLog(), "device locked, locking app");
+        APLWriteUnlockExpiry(0);  // the device lock ends the app's grace period
         APLLockApp();
     }];
 

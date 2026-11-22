@@ -40,7 +40,7 @@
 			<key>label</key>
 			<string>锁定时机</string>
 			<key>footerText</key>
-			<string>每次打开 App 都会验证一次。退到后台超过设定时间再回来、或设备锁屏时，也会重新验证。</string>
+			<string>退到后台超过设定时间、设备锁屏、或后台进程被系统结束后重新打开，都需要重新验证；在设定时间内重新打开（含被系统结束进程后）不再验证。「不锁定」时只有设备锁屏才会再次验证。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
