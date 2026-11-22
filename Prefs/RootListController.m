@@ -4,7 +4,11 @@
 // those rows look and behave like the rest of Settings. Between them this
 // controller puts the background-lock delay row, which opens a page of its own
 // (Preferences' own value picker drew nothing on this iOS build), and below
-// them one switch per installed app, over a search field.
+// them one switch per installed app.
+//
+// Searching does not rebuild the pane's rows: it shows its own results table,
+// which is what made typing stutter when the filtering ran through
+// PSListController's insert-and-remove.
 // Every row stores into the package's own preferences domain and posts
 // `<package id>/changed`, which is exactly what the tweak reads inside the app.
 
@@ -34,6 +38,44 @@
 + (UIImage *)_applicationIconImageForBundleIdentifier:(NSString *)bundleID format:(int)format scale:(CGFloat)scale;
 @end
 
+@protocol FaceLockProtectionToggling <NSObject>
+- (BOOL)isProtectedBundleID:(NSString *)bundleID;
+- (void)setProtection:(BOOL)protection forBundleID:(NSString *)bundleID;
+@end
+
+#pragma mark - Shared helpers
+
+static UIImage *APLIconForBundle(NSString *bundleID) {
+    SEL selector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
+    if (![UIImage respondsToSelector:selector]) {
+        return nil;
+    }
+    return [UIImage _applicationIconImageForBundleIdentifier:bundleID format:0 scale:[UIScreen mainScreen].scale];
+}
+
+static CFStringRef APLDomain(void) {
+    return (__bridge CFStringRef)APLPreferencesDomain();
+}
+
+static BOOL APLBoolPreference(NSString *key, BOOL fallback) {
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key, APLDomain());
+    if (value == NULL) {
+        return fallback;
+    }
+    BOOL result = fallback;
+    if (CFGetTypeID(value) == CFBooleanGetTypeID() || CFGetTypeID(value) == CFNumberGetTypeID()) {
+        result = [(__bridge NSNumber *)value boolValue];
+    }
+    CFRelease(value);
+    return result;
+}
+
+static void APLSetBoolPreference(NSString *key, BOOL value) {
+    CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFTypeRef)@(value), APLDomain());
+    CFPreferencesAppSynchronize(APLDomain());
+    notify_post(APLChangedNotificationName().UTF8String);
+}
+
 #pragma mark - The delay's own page
 
 /// The choices the 后台锁定时机 row offers, in seconds (-1: never).
@@ -46,8 +88,7 @@ static NSArray<NSString *> *APLLockDelayTitles(void) {
 }
 
 static NSInteger APLIntegerPreference(NSString *key, NSInteger fallback) {
-    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
-                                                        (__bridge CFStringRef)APLPreferencesDomain());
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key, APLDomain());
     if (value == NULL) {
         return fallback;
     }
@@ -60,10 +101,8 @@ static NSInteger APLIntegerPreference(NSString *key, NSInteger fallback) {
 }
 
 static void APLSetIntegerPreference(NSString *key, NSInteger value) {
-    CFPreferencesSetAppValue((__bridge CFStringRef)key,
-                             (__bridge CFTypeRef)@(value),
-                             (__bridge CFStringRef)APLPreferencesDomain());
-    CFPreferencesAppSynchronize((__bridge CFStringRef)APLPreferencesDomain());
+    CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFTypeRef)@(value), APLDomain());
+    CFPreferencesAppSynchronize(APLDomain());
     notify_post(APLChangedNotificationName().UTF8String);
 }
 
@@ -120,24 +159,115 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
 
 @end
 
-#pragma mark - The pane
+#pragma mark - Search results
 
-@interface FaceLockPrefsRootListController : PSListController <UISearchResultsUpdating>
+/// Its own table, rebuilt from an in-memory list: typing never touches the
+/// pane's specifiers.
+@interface FaceLockSearchController : UIViewController <UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating>
+- (instancetype)initWithApps:(NSArray *)apps parent:(id<FaceLockProtectionToggling>)parent;
 @end
 
-@implementation FaceLockPrefsRootListController {
-    NSMutableArray<PSSpecifier *> *_appSpecifiers;
-    NSString *_appliedQuery;
-    NSUInteger _searchGeneration;
+@implementation FaceLockSearchController {
+    UITableView *_tableView;
+    NSArray *_apps;
+    NSArray *_matches;
+    __weak id<FaceLockProtectionToggling> _parent;
+}
+
+- (instancetype)initWithApps:(NSArray *)apps parent:(id<FaceLockProtectionToggling>)parent {
+    self = [super initWithNibName:nil bundle:nil];
+    if (self != nil) {
+        _apps = [apps copy];
+        _parent = parent;
+        _matches = _apps;
+    }
+    return self;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    UISearchController *search = [[UISearchController alloc] initWithSearchResultsController:nil];
-    search.searchResultsUpdater = self;
-    search.obscuresBackgroundDuringPresentation = NO;
+    _tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    _tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    _tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _tableView.accessibilityIdentifier = @"FaceLockSearchResults";
+    [self.view addSubview:_tableView];
+}
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
+    NSString *query = [[searchController.searchBar.text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    if (query.length == 0) {
+        _matches = _apps;
+    } else {
+        NSMutableArray *matches = [NSMutableArray array];
+        for (LSApplicationProxy *app in _apps) {
+            NSString *name = [[app localizedName] lowercaseString];
+            NSString *bundleID = [[app bundleIdentifier] lowercaseString] ?: @"";
+            if ([(name ?: @"") containsString:query] || [bundleID containsString:query]) {
+                [matches addObject:app];
+            }
+        }
+        _matches = matches;
+    }
+    [_tableView reloadData];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return (NSInteger)_matches.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *identifier = @"FaceLockSearchCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:identifier];
+    if (cell == nil) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        cell.textLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        cell.textLabel.textColor = [UIColor labelColor];
+        UISwitch *toggle = [[UISwitch alloc] init];
+        [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = toggle;
+    }
+    LSApplicationProxy *app = _matches[indexPath.row];
+    NSString *bundleID = app.bundleIdentifier;
+    cell.textLabel.text = app.localizedName.length ? app.localizedName : bundleID;
+    cell.imageView.image = APLIconForBundle(bundleID);
+    UISwitch *toggle = (UISwitch *)cell.accessoryView;
+    toggle.tag = indexPath.row;
+    toggle.on = [_parent isProtectedBundleID:bundleID];
+    return cell;
+}
+
+- (void)toggleChanged:(UISwitch *)sender {
+    NSInteger row = sender.tag;
+    if (row < 0 || row >= (NSInteger)_matches.count) {
+        return;
+    }
+    LSApplicationProxy *app = _matches[(NSUInteger)row];
+    [_parent setProtection:sender.on forBundleID:app.bundleIdentifier];
+}
+
+@end
+
+#pragma mark - The pane
+
+@interface FaceLockPrefsRootListController : PSListController <FaceLockProtectionToggling>
+@end
+
+@implementation FaceLockPrefsRootListController {
+    NSMutableArray<PSSpecifier *> *_appSpecifiers;
+    NSMutableDictionary<NSString *, PSSpecifier *> *_appSpecifiersByBundleID;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+
+    FaceLockSearchController *results = [[FaceLockSearchController alloc] initWithApps:[self installedApps] parent:self];
+    UISearchController *search = [[UISearchController alloc] initWithSearchResultsController:results];
+    search.searchResultsUpdater = results;
     search.searchBar.placeholder = @"搜索 App";
+    search.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
     self.navigationItem.searchController = search;
     self.navigationItem.hidesSearchBarWhenScrolling = NO;
     self.definesPresentationContext = YES;
@@ -169,6 +299,20 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     return _specifiers;
 }
 
+#pragma mark - Protection
+
+- (BOOL)isProtectedBundleID:(NSString *)bundleID {
+    return APLBoolPreference(APLKeyForBundle(bundleID), NO);
+}
+
+- (void)setProtection:(BOOL)protection forBundleID:(NSString *)bundleID {
+    APLSetBoolPreference(APLKeyForBundle(bundleID), protection);
+    PSSpecifier *specifier = _appSpecifiersByBundleID[bundleID];
+    if (specifier != nil) {
+        [self reloadSpecifier:specifier];
+    }
+}
+
 #pragma mark - Rows
 
 - (PSSpecifier *)switchRowNamed:(NSString *)name key:(NSString *)key {
@@ -191,7 +335,11 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     if (_appSpecifiers == nil) {
         _appSpecifiers = [NSMutableArray array];
     }
+    if (_appSpecifiersByBundleID == nil) {
+        _appSpecifiersByBundleID = [NSMutableDictionary dictionary];
+    }
     [_appSpecifiers removeAllObjects];
+    [_appSpecifiersByBundleID removeAllObjects];
 
     PSSpecifier *header = [PSSpecifier groupSpecifierWithName:@"已保护的 App"];
     NSArray *apps = [self installedApps];
@@ -207,65 +355,15 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
 
         PSSpecifier *specifier = [self switchRowNamed:name key:APLKeyForBundle(bundleID)];
         [specifier setProperty:bundleID forKey:@"id"];
-        UIImage *icon = [self iconForBundleID:bundleID];
+        UIImage *icon = APLIconForBundle(bundleID);
         if (icon != nil) {
             [specifier setProperty:icon forKey:@"iconImage"];
         }
         [specifiers addObject:specifier];
         [_appSpecifiers addObject:specifier];
+        _appSpecifiersByBundleID[bundleID] = specifier;
     }
     return specifiers;
-}
-
-#pragma mark - Search
-
-- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
-    NSString *query = [[searchController.searchBar.text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
-    if ([query isEqualToString:_appliedQuery ?: @""]) {
-        return;
-    }
-    // Filtering rebuilds rows; one keystroke at a time made typing feel stuck,
-    // so wait for the run of keystrokes to settle.
-    NSUInteger generation = ++_searchGeneration;
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (strongSelf == nil || strongSelf->_searchGeneration != generation) {
-            return;
-        }
-        strongSelf->_appliedQuery = query;
-        [strongSelf applyQuery:query];
-    });
-}
-
-- (void)applyQuery:(NSString *)query {
-    NSArray *visible = [[self specifiers] copy];
-    for (PSSpecifier *specifier in _appSpecifiers) {
-        if ([visible containsObject:specifier]) {
-            [self removeSpecifier:specifier animated:NO];
-        }
-    }
-    NSInteger index = (NSInteger)[[self specifiers] count];
-    for (PSSpecifier *specifier in _appSpecifiers) {
-        NSString *name = [[specifier name] lowercaseString];
-        NSString *bundleID = [[specifier propertyForKey:@"id"] lowercaseString] ?: @"";
-        BOOL matches = query.length == 0 || [name containsString:query] || [bundleID containsString:query];
-        if (!matches) {
-            continue;
-        }
-        [self insertSpecifier:specifier atIndex:index animated:NO];
-        index++;
-    }
-}
-
-#pragma mark - Icons
-
-- (UIImage *)iconForBundleID:(NSString *)bundleID {
-    SEL selector = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
-    if (![UIImage respondsToSelector:selector]) {
-        return nil;
-    }
-    return [UIImage _applicationIconImageForBundleIdentifier:bundleID format:0 scale:[UIScreen mainScreen].scale];
 }
 
 #pragma mark - Launch Services
