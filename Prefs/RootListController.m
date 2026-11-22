@@ -82,17 +82,16 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
         NSArray<NSString *> *titles = APLLockDelayTitles();
         NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
         for (NSUInteger index = 0; index < titles.count; index++) {
-            // The tick is part of the label: a code-built row's cell did not
-            // keep the accessory type this controller set on it.
             BOOL selected = index < values.count && values[index].integerValue == current;
-            NSString *name = selected ? [NSString stringWithFormat:@"✓  %@", titles[index]] : [NSString stringWithFormat:@"    %@", titles[index]];
-            PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:name
+            PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:titles[index]
                                                                     target:self
                                                                        set:nil
                                                                        get:nil
                                                                     detail:nil
                                                                       cell:PSListItemCell
                                                                       edit:nil];
+            // A row's value is drawn at its right edge.
+            [specifier setProperty:(selected ? @"✓" : @"") forKey:@"value"];
             [specifiers addObject:specifier];
         }
         _specifiers = specifiers;
