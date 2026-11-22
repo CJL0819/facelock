@@ -299,10 +299,9 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     return workspace;
 }
 
-/// The apps a person can see on the Home Screen: anything SpringBoard shows an
-/// icon for, plus whatever they installed themselves. Apps that only live
-/// lower in the system (hidden apps, web clips, placeholders, internal
-/// bundles) stay out.
+/// The apps a person can see on the Home Screen: Apple's own apps and whatever
+/// they installed. Internal components, which Launch Services tags `hidden`,
+/// stay out.
 - (NSArray *)installedApps {
     id workspace = [self workspace];
     if (workspace == nil || ![workspace respondsToSelector:@selector(allInstalledApplications)]) {
@@ -324,15 +323,13 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
             continue;
         }
 
-        // SpringBoard marks the apps it puts on a Home Screen as "visible".
+        // Internal components (Input UI, User Authentication, view services)
+        // carry a `hidden` tag; the apps on a Home Screen do not.
         NSArray *tags = nil;
         if ([app respondsToSelector:@selector(appTags)]) {
             tags = app.appTags;
         }
-        if (![tags isKindOfClass:[NSArray class]]) {
-            tags = nil;
-        }
-        if ([tags containsObject:@"hidden"]) {
+        if ([tags isKindOfClass:[NSArray class]] && [tags containsObject:@"hidden"]) {
             continue;
         }
 
@@ -340,12 +337,8 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
         if ([app respondsToSelector:@selector(applicationType)]) {
             type = app.applicationType;
         }
-        BOOL userInstalled = [type isEqualToString:@"User"];
-        BOOL onHomeScreen = [tags containsObject:@"visible"];
-        if (tags != nil || type.length > 0) {
-            if (!userInstalled && !onHomeScreen) {
-                continue;  // Internal bundles, web clips, placeholders.
-            }
+        if (type.length > 0 && ![type isEqualToString:@"User"] && ![type isEqualToString:@"System"]) {
+            continue;  // Web clips and placeholders.
         }
 
         if ([app respondsToSelector:@selector(isHidden)] && app.isHidden) {
