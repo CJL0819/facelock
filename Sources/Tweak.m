@@ -220,6 +220,14 @@ static UIColor *APLAccentColor(void) {
     }
     notify_set_state(requestHandle, (uint64_t)token);
     notify_post(requestName.UTF8String);
+
+    // The service may have only just been told about this app; ask again once
+    // if nothing comes back.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self->_authenticating && self->_requestToken == token) {
+            notify_post(requestName.UTF8String);
+        }
+    });
     notify_cancel(requestHandle);
     os_log(TweakLog(), "asked for Face ID, token %u", token);
 
@@ -523,6 +531,11 @@ static void APLInstallObservers(void) {
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *__unused note) {
         if (!sEnabled || !sProtected) {
+            // Protection may have been switched on while this app waited in
+            // the background: read the settings again before deciding.
+            APLApplyStateFromFile();
+        }
+        if (!sEnabled || !sProtected) {
             return;
         }
         // Back from the background: lock once the chosen wait has passed.
@@ -751,6 +764,9 @@ static void APLSetupSpringBoardService(void) {
     APLRefreshAuthListeners();
     notify_register_dispatch(APLChangedNotificationName().UTF8String, &changeToken, dispatch_get_main_queue(), ^(int __unused note) {
         os_log(TweakLog(), "settings changed, refreshing the auth service");
+        // Take the new app in at once, and again once cfprefsd has flushed the
+        // settings file this service reads.
+        APLRefreshAuthListeners();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             APLRefreshAuthListeners();
         });
