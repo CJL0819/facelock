@@ -500,8 +500,12 @@ static void APLPromptIfNeeded(void) {
     if (!sLocked || sAuthAttemptStarted || sLockController == nil) {
         return;
     }
-    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
-        os_log(TweakLog(), "not prompting: app is not in front");
+    // An app that is still coming up counts as in front: asking now lets the
+    // prompt and the launch run side by side. Only a backgrounded app is left
+    // alone, since a prompt it asked for would hold the sensor open over
+    // whatever is on screen.
+    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
+        os_log(TweakLog(), "not prompting: app is in the background");
         return;
     }
     sAuthAttemptStarted = YES;
@@ -675,8 +679,9 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
     sProtected = protected;
     sLockDelay = domain != nil ? APLIntegerInDomain(domain, APLKeyForLockDelay(), 0) : 0;
     sLockOnDeviceLock = domain != nil ? APLBoolInDomain(domain, APLKeyForLockOnDeviceLock(), YES) : YES;
-    os_log(TweakLog(), "state enabled=%d protected=%d delay=%ld deviceLock=%d",
-           (int)sEnabled, (int)sProtected, (long)sLockDelay, (int)sLockOnDeviceLock);
+    os_log(TweakLog(), "state enabled=%d protected=%d delay=%ld deviceLock=%d appState=%ld",
+           (int)sEnabled, (int)sProtected, (long)sLockDelay, (int)sLockOnDeviceLock,
+           (long)[UIApplication sharedApplication].applicationState);
 
     if (!(sEnabled && sProtected)) {
         APLClearUnlockRecord();
