@@ -322,6 +322,11 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
         if (bundleID.length == 0 || [bundleID isEqualToString:@"com.apple.springboard"]) {
             continue;
         }
+        // Safari's "Web" bundle is an app container for web apps, not an icon
+        // on a Home Screen, and Launch Services does not tag it `hidden`.
+        if ([bundleID isEqualToString:@"com.apple.webapp"]) {
+            continue;
+        }
 
         // Internal components (Input UI, User Authentication, view services)
         // carry a `hidden` tag; the apps on a Home Screen do not.
