@@ -298,7 +298,7 @@ static UIColor *APLAccentColor(void) {
         if (notify_get_state(stateHandle, &state) != NOTIFY_STATUS_OK) {
             return;
         }
-        if ((uint32_t)(state >> 1) != token) {
+        if ((uint32_t)(state >> 2) != token) {
             return;  // An older request's answer.
         }
         notify_cancel(stateHandle);
@@ -308,13 +308,20 @@ static UIColor *APLAccentColor(void) {
         }
         self->_authenticating = NO;
         BOOL granted = (state & 1) != 0;
-        os_log(TweakLog(), "Face ID answer granted=%d automatic=%d", (int)granted, (int)self->_requestWasAutomatic);
+        BOOL cancelled = (state & 2) != 0;
+        os_log(TweakLog(), "Face ID answer granted=%d cancelled=%d automatic=%d",
+               (int)granted, (int)cancelled, (int)self->_requestWasAutomatic);
         if (granted) {
             self->_autoAttempts = 0;
             [self setStatusText:nil];
             if (self.onUnlocked) {
                 self.onUnlocked();
             }
+        } else if (cancelled) {
+            // The person said no: stop asking on their behalf and leave them
+            // the two buttons.
+            self->_autoAttempts = 3;
+            [self setStatusText:nil];
         } else if (self->_requestWasAutomatic) {
             // A failed automatic try hands over quietly to the user, unless
             // there are tries left.
@@ -905,14 +912,16 @@ static NSString *APLDisplayNameForBundle(NSString *bundleID) {
     return bundleID;
 }
 
-static void APLPublishAuthResult(NSString *bundleID, uint32_t token, BOOL granted) {
+static void APLPublishAuthResult(NSString *bundleID, uint32_t token, BOOL granted, BOOL cancelled) {
     NSString *name = APLAuthResultName(bundleID);
     int handle = 0;
     if (notify_register_check(name.UTF8String, &handle) != NOTIFY_STATUS_OK) {
         os_log(TweakLog(), "cannot publish Face ID answer for %{public}s", bundleID.UTF8String);
         return;
     }
-    notify_set_state(handle, ((uint64_t)token << 1) | (granted ? 1 : 0));
+    // token << 2 | granted | cancelled << 1: the lock screen stops its
+    // automatic tries when the person cancelled the system dialog.
+    notify_set_state(handle, ((uint64_t)token << 2) | (granted ? 1 : 0) | (cancelled ? 2 : 0));
     notify_post(name.UTF8String);
     notify_cancel(handle);
 }
@@ -942,7 +951,7 @@ static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
             [sAuthContextTokens removeObjectForKey:bundleID];
             os_log(TweakLog(), "Face ID for %{public}s success=%d error=%{public}s",
                    bundleID.UTF8String, (int)success, error.localizedDescription.UTF8String ?: "(none)");
-            APLPublishAuthResult(bundleID, token, success);
+            APLPublishAuthResult(bundleID, token, success, error.code == LAErrorUserCancel);
         });
     }];
 
@@ -957,7 +966,7 @@ static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
         [sAuthContexts removeObjectForKey:bundleID];
         [sAuthContextTokens removeObjectForKey:bundleID];
         [context invalidate];
-        APLPublishAuthResult(bundleID, token, NO);
+        APLPublishAuthResult(bundleID, token, NO, NO);
     });
 }
 
@@ -982,7 +991,7 @@ static void APLHandleAuthRequest(NSString *bundleID, int handle) {
         [sAuthContexts removeObjectForKey:bundleID];
         [sAuthContextTokens removeObjectForKey:bundleID];
         [stale invalidate];  // close the dialog that is up
-        APLPublishAuthResult(bundleID, running.unsignedIntValue, NO);
+        APLPublishAuthResult(bundleID, running.unsignedIntValue, NO, NO);
 
         // Give the dialog time to leave the screen before the next one opens,
         // so a retry does not look like one dialog flickering into another.
