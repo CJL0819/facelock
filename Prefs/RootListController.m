@@ -78,8 +78,15 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
 - (NSArray *)specifiers {
     if (_specifiers == nil) {
         NSMutableArray *specifiers = [NSMutableArray array];
-        for (NSString *title in APLLockDelayTitles()) {
-            PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:title
+        NSArray<NSNumber *> *values = APLLockDelayValues();
+        NSArray<NSString *> *titles = APLLockDelayTitles();
+        NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
+        for (NSUInteger index = 0; index < titles.count; index++) {
+            // The tick is part of the label: a code-built row's cell did not
+            // keep the accessory type this controller set on it.
+            BOOL selected = index < values.count && values[index].integerValue == current;
+            NSString *name = selected ? [NSString stringWithFormat:@"✓  %@", titles[index]] : [NSString stringWithFormat:@"    %@", titles[index]];
+            PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:name
                                                                     target:self
                                                                        set:nil
                                                                        get:nil
@@ -91,14 +98,6 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
         _specifiers = specifiers;
     }
     return _specifiers;
-}
-
-- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
-    NSArray<NSNumber *> *values = APLLockDelayValues();
-    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
-    BOOL selected = indexPath.row < (NSInteger)values.count && values[indexPath.row].integerValue == current;
-    cell.accessoryType = selected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
-    cell.tintColor = [UIColor colorWithRed:0.0 green:0.478 blue:1.0 alpha:1.0];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
