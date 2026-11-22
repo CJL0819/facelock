@@ -163,7 +163,7 @@
   "package": {
     "id": "com.404.facelock",
     "name": "应用面容锁",
-    "version": "0.0.5",
+    "version": "0.0.6",
     "description": "为选定的 App 加上面容 ID 锁。",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "Apelin User",

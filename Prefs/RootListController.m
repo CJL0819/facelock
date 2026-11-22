@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MIT
 //
 // The Settings pane. It carries the master switch, how long the app stays
-// unlocked in the background, whether the device locking locks the app, and
-// one switch per installed app (with a search field over the list). Each row
-// stores its value in the package's own preferences domain and posts
+// unlocked in the background (its own page, because a list built in code is
+// not what PSLinkListCell draws), whether the device locking locks the app,
+// and one switch per installed app (with a search field over the list).
+// Each row stores its value in the package's own preferences domain and posts
 // `<package id>/changed`, which is exactly what the tweak reads inside the app.
 
 #import <Preferences/PSListController.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <notify.h>
 #import <objc/runtime.h>
 
 #import "Protect.h"
@@ -30,11 +32,89 @@
 + (UIImage *)_applicationIconImageForBundleIdentifier:(NSString *)bundleID format:(int)format scale:(CGFloat)scale;
 @end
 
+#pragma mark - The delay's own page
+
+/// The choices the 后台锁定时机 row offers, in seconds (-1: never).
+static NSArray<NSNumber *> *APLLockDelayValues(void) {
+    return @[@0, @30, @60, @300, @600, @-1];
+}
+
+static NSArray<NSString *> *APLLockDelayTitles(void) {
+    return @[@"立即", @"30 秒后", @"1 分钟后", @"5 分钟后", @"10 分钟后", @"不锁定"];
+}
+
+static NSInteger APLIntegerPreference(NSString *key, NSInteger fallback) {
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
+                                                        (__bridge CFStringRef)APLPreferencesDomain());
+    if (value == NULL) {
+        return fallback;
+    }
+    NSInteger result = fallback;
+    if (CFGetTypeID(value) == CFNumberGetTypeID() || CFGetTypeID(value) == CFBooleanGetTypeID()) {
+        result = [(__bridge NSNumber *)value integerValue];
+    }
+    CFRelease(value);
+    return result;
+}
+
+static void APLSetIntegerPreference(NSString *key, NSInteger value) {
+    CFPreferencesSetAppValue((__bridge CFStringRef)key,
+                             (__bridge CFTypeRef)@(value),
+                             (__bridge CFStringRef)APLPreferencesDomain());
+    CFPreferencesAppSynchronize((__bridge CFStringRef)APLPreferencesDomain());
+    notify_post(APLChangedNotificationName().UTF8String);
+}
+
+@interface FaceLockDelayListController : PSListController
+@end
+
+@implementation FaceLockDelayListController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"后台锁定时机";
+}
+
+- (NSArray *)specifiers {
+    if (_specifiers == nil) {
+        NSMutableArray *specifiers = [NSMutableArray array];
+        for (NSString *title in APLLockDelayTitles()) {
+            PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:title
+                                                                    target:self
+                                                                       set:nil
+                                                                       get:nil
+                                                                    detail:nil
+                                                                      cell:PSListItemCell
+                                                                      edit:nil];
+            [specifiers addObject:specifier];
+        }
+        _specifiers = specifiers;
+    }
+    return _specifiers;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSArray<NSNumber *> *values = APLLockDelayValues();
+    if (indexPath.row < (NSInteger)values.count) {
+        APLSetIntegerPreference(APLKeyForLockDelay(), values[indexPath.row].integerValue);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self.navigationController popViewControllerAnimated:YES];
+    });
+}
+
+@end
+
+#pragma mark - The pane
+
 @interface FaceLockPrefsRootListController : PSListController <UISearchResultsUpdating>
 @end
 
 @implementation FaceLockPrefsRootListController {
     NSMutableArray<PSSpecifier *> *_appSpecifiers;
+    NSString *_appliedQuery;
+    NSUInteger _searchGeneration;
 }
 
 - (void)viewDidLoad {
@@ -47,6 +127,15 @@
     self.navigationItem.searchController = search;
     self.navigationItem.hidesSearchBarWhenScrolling = NO;
     self.definesPresentationContext = YES;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // The delay page may have changed the row's value behind this one.
+    PSSpecifier *delay = [self specifierForID:@"lockDelay"];
+    if (delay != nil) {
+        [self reloadSpecifier:delay];
+    }
 }
 
 - (NSArray *)specifiers {
@@ -76,17 +165,12 @@
 
     PSSpecifier *delay = [PSSpecifier preferenceSpecifierNamed:@"后台锁定时机"
                                                         target:self
-                                                           set:@selector(setPreferenceValue:specifier:)
-                                                           get:@selector(readPreferenceValue:)
-                                                        detail:nil
-                                                          cell:PSLinkListCell
+                                                           set:nil
+                                                           get:@selector(delayDescription:)
+                                                        detail:[FaceLockDelayListController class]
+                                                          cell:PSLinkCell
                                                           edit:nil];
-    [delay setProperty:APLKeyForLockDelay() forKey:@"key"];
-    [delay setProperty:domain forKey:@"defaults"];
-    [delay setProperty:@0 forKey:@"default"];
-    [delay setProperty:@[@-1, @0, @30, @60, @300, @600] forKey:@"values"];
-    [delay setProperty:@[@"不锁定", @"立即", @"30 秒后", @"1 分钟后", @"5 分钟后", @"10 分钟后"] forKey:@"titles"];
-    [delay setProperty:notification forKey:@"PostNotification"];
+    delay.identifier = @"lockDelay";
     [specifiers addObject:delay];
 
     PSSpecifier *deviceLock = [self valueRowNamed:@"设备锁屏时锁定" key:APLKeyForLockOnDeviceLock() domain:domain notification:notification];
@@ -95,6 +179,13 @@
 
     [specifiers addObjectsFromArray:[self appSpecifiers]];
     return specifiers;
+}
+
+/// The subtitle a link row shows for the delay page.
+- (id)delayDescription:(PSSpecifier *)specifier {
+    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
+    NSUInteger index = [APLLockDelayValues() indexOfObject:@(current)];
+    return index == NSNotFound ? @"立即" : APLLockDelayTitles()[index];
 }
 
 #pragma mark - Rows
@@ -151,7 +242,25 @@
 #pragma mark - Search
 
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
-    NSString *query = [[[searchController.searchBar.text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString] copy];
+    NSString *query = [[searchController.searchBar.text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    if ([query isEqualToString:_appliedQuery ?: @""]) {
+        return;
+    }
+    // Filtering rebuilds rows; one keystroke at a time made typing feel stuck,
+    // so wait for the run of keystrokes to settle.
+    NSUInteger generation = ++_searchGeneration;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil || strongSelf->_searchGeneration != generation) {
+            return;
+        }
+        strongSelf->_appliedQuery = query;
+        [strongSelf applyQuery:query];
+    });
+}
+
+- (void)applyQuery:(NSString *)query {
     NSArray *visible = [[self specifiers] copy];
     for (PSSpecifier *specifier in _appSpecifiers) {
         if ([visible containsObject:specifier]) {
@@ -212,6 +321,8 @@
     return workspace;
 }
 
+/// The apps a person installed: App Store, TrollStore and sideloaded ones.
+/// System apps are left out, as asked.
 - (NSArray *)installedApps {
     id workspace = [self workspace];
     if (workspace == nil || ![workspace respondsToSelector:@selector(allInstalledApplications)]) {
@@ -232,11 +343,8 @@
         if (bundleID.length == 0 || [bundleID isEqualToString:@"com.apple.springboard"]) {
             continue;
         }
-        if ([app respondsToSelector:@selector(applicationType)]) {
-            NSString *type = app.applicationType;
-            if (type.length > 0 && ![type isEqualToString:@"User"] && ![type isEqualToString:@"System"]) {
-                continue;  // Web apps, placeholders and the like.
-            }
+        if ([app respondsToSelector:@selector(applicationType)] && ![app.applicationType isEqualToString:@"User"]) {
+            continue;  // System apps stay out of the list.
         }
         if ([app respondsToSelector:@selector(isHidden)] && app.isHidden) {
             continue;
