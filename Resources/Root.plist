@@ -1,10 +1,93 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	The pane's fixed rows. Preferences draws them, so they carry Settings'
+	own typography, and the PSLinkListCell row opens the framework's own
+	picker, which ticks the chosen value and shows it on the row.
+	`defaults` and `PostNotification` name this package's preferences domain.
+-->
 <plist version="1.0">
 <dict>
 	<key>title</key>
 	<string>应用面容锁</string>
 	<key>items</key>
-	<array/>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>面容锁</string>
+			<key>footerText</key>
+			<string>打开受保护的 App 时需要面容 ID 验证，验证不通过就无法继续使用。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>启用保护</string>
+			<key>key</key>
+			<string>enabled</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.404.facelock</string>
+			<key>PostNotification</key>
+			<string>com.404.facelock/changed</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>锁定时机</string>
+			<key>footerText</key>
+			<string>每次打开 App 都会验证一次。退到后台超过设定时间再回来、或设备锁屏时，也会重新验证。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>label</key>
+			<string>后台锁定时机</string>
+			<key>key</key>
+			<string>backgroundLockDelay</string>
+			<key>default</key>
+			<integer>0</integer>
+			<key>defaults</key>
+			<string>com.404.facelock</string>
+			<key>PostNotification</key>
+			<string>com.404.facelock/changed</string>
+			<key>values</key>
+			<array>
+				<integer>0</integer>
+				<integer>30</integer>
+				<integer>60</integer>
+				<integer>300</integer>
+				<integer>600</integer>
+				<integer>-1</integer>
+			</array>
+			<key>titles</key>
+			<array>
+				<string>立即</string>
+				<string>30 秒后</string>
+				<string>1 分钟后</string>
+				<string>5 分钟后</string>
+				<string>10 分钟后</string>
+				<string>不锁定</string>
+			</array>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>设备锁屏时锁定</string>
+			<key>key</key>
+			<string>lockOnDeviceLock</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.404.facelock</string>
+			<key>PostNotification</key>
+			<string>com.404.facelock/changed</string>
+		</dict>
+	</array>
 </dict>
 </plist>

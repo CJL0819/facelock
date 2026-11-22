@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-// The Settings pane. It carries the master switch, how long the app stays
-// unlocked in the background (its own page, because a list built in code is
-// not what PSLinkListCell draws), whether the device locking locks the app,
-// and one switch per installed app (with a search field over the list).
-// Each row stores its value in the package's own preferences domain and posts
+// The Settings pane. Root.plist carries the fixed rows — the master switch, the
+// background lock delay (Preferences' own value picker) and the device-lock
+// switch — so they look and behave like the rest of Settings. Below them this
+// controller adds one switch per installed app, over a search field.
+// Every row stores into the package's own preferences domain and posts
 // `<package id>/changed`, which is exactly what the tweak reads inside the app.
 
 #import <Preferences/PSListController.h>
@@ -32,92 +32,6 @@
 + (UIImage *)_applicationIconImageForBundleIdentifier:(NSString *)bundleID format:(int)format scale:(CGFloat)scale;
 @end
 
-#pragma mark - The delay's own page
-
-/// The choices the 后台锁定时机 row offers, in seconds (-1: never).
-static NSArray<NSNumber *> *APLLockDelayValues(void) {
-    return @[@0, @30, @60, @300, @600, @-1];
-}
-
-static NSArray<NSString *> *APLLockDelayTitles(void) {
-    return @[@"立即", @"30 秒后", @"1 分钟后", @"5 分钟后", @"10 分钟后", @"不锁定"];
-}
-
-static NSInteger APLIntegerPreference(NSString *key, NSInteger fallback) {
-    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key,
-                                                        (__bridge CFStringRef)APLPreferencesDomain());
-    if (value == NULL) {
-        return fallback;
-    }
-    NSInteger result = fallback;
-    if (CFGetTypeID(value) == CFNumberGetTypeID() || CFGetTypeID(value) == CFBooleanGetTypeID()) {
-        result = [(__bridge NSNumber *)value integerValue];
-    }
-    CFRelease(value);
-    return result;
-}
-
-static void APLSetIntegerPreference(NSString *key, NSInteger value) {
-    CFPreferencesSetAppValue((__bridge CFStringRef)key,
-                             (__bridge CFTypeRef)@(value),
-                             (__bridge CFStringRef)APLPreferencesDomain());
-    CFPreferencesAppSynchronize((__bridge CFStringRef)APLPreferencesDomain());
-    notify_post(APLChangedNotificationName().UTF8String);
-}
-
-@interface FaceLockDelayListController : PSListController
-@end
-
-@implementation FaceLockDelayListController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"后台锁定时机";
-}
-
-- (NSArray *)specifiers {
-    if (_specifiers == nil) {
-        NSMutableArray *specifiers = [NSMutableArray array];
-        for (NSString *title in APLLockDelayTitles()) {
-            PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:title
-                                                                    target:self
-                                                                       set:nil
-                                                                       get:@selector(tickForSpecifier:)
-                                                                    detail:nil
-                                                                      cell:PSListItemCell
-                                                                      edit:nil];
-            [specifiers addObject:specifier];
-        }
-        _specifiers = specifiers;
-    }
-    return _specifiers;
-}
-
-/// Preferences draws what a row's getter returns at the row's right edge.
-- (id)tickForSpecifier:(PSSpecifier *)specifier {
-    NSUInteger row = [APLLockDelayTitles() indexOfObject:[specifier name]];
-    if (row == NSNotFound || row >= APLLockDelayValues().count) {
-        return @"";
-    }
-    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
-    return APLLockDelayValues()[row].integerValue == current ? @"✓" : @"";
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    NSArray<NSNumber *> *values = APLLockDelayValues();
-    if (indexPath.row < (NSInteger)values.count) {
-        APLSetIntegerPreference(APLKeyForLockDelay(), values[indexPath.row].integerValue);
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self.navigationController popViewControllerAnimated:YES];
-    });
-}
-
-@end
-
-#pragma mark - The pane
-
 @interface FaceLockPrefsRootListController : PSListController <UISearchResultsUpdating>
 @end
 
@@ -139,78 +53,18 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     self.definesPresentationContext = YES;
 }
 
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    // The delay page may have changed the value behind this row: show it.
-    PSSpecifier *delay = [self specifierForID:@"lockDelay"];
-    if (delay != nil) {
-        delay.name = [self delayRowName];
-        [self reloadSpecifier:delay];
-    }
-}
-
-/// The row's label carries the choice, so the pane shows it without opening
-/// the page again.
-- (NSString *)delayRowName {
-    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
-    NSUInteger index = [APLLockDelayValues() indexOfObject:@(current)];
-    NSString *title = index == NSNotFound ? @"立即" : APLLockDelayTitles()[index];
-    return [NSString stringWithFormat:@"后台锁定时机 · %@", title];
-}
-
 - (NSArray *)specifiers {
     if (_specifiers == nil) {
-        _specifiers = [self buildSpecifiers];
+        NSMutableArray *specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+        [specifiers addObjectsFromArray:[self appSpecifiers]];
+        _specifiers = specifiers;
     }
     return _specifiers;
 }
 
-- (NSMutableArray *)buildSpecifiers {
-    NSMutableArray *specifiers = [NSMutableArray array];
-    NSString *domain = APLPreferencesDomain();
-    NSString *notification = APLChangedNotificationName();
-
-    PSSpecifier *intro = [PSSpecifier groupSpecifierWithName:@"面容锁"];
-    [intro setProperty:@"打开受保护的 App 时需要面容 ID 验证，验证不通过就无法继续使用。" forKey:@"footerText"];
-    [specifiers addObject:intro];
-
-    PSSpecifier *master = [self valueRowNamed:@"启用保护" key:APLKeyForEnabled() domain:domain notification:notification];
-    [master setProperty:@YES forKey:@"default"];
-    [specifiers addObject:master];
-
-    PSSpecifier *timing = [PSSpecifier groupSpecifierWithName:@"锁定时机"];
-    [timing setProperty:@"每次打开 App 都会验证一次。退到后台超过设定时间再回来、或设备锁屏时，也会重新验证。"
-                 forKey:@"footerText"];
-    [specifiers addObject:timing];
-
-    PSSpecifier *delay = [PSSpecifier preferenceSpecifierNamed:[self delayRowName]
-                                                        target:self
-                                                           set:nil
-                                                           get:@selector(delayDescription:)
-                                                        detail:[FaceLockDelayListController class]
-                                                          cell:PSLinkCell
-                                                          edit:nil];
-    delay.identifier = @"lockDelay";
-    [specifiers addObject:delay];
-
-    PSSpecifier *deviceLock = [self valueRowNamed:@"设备锁屏时锁定" key:APLKeyForLockOnDeviceLock() domain:domain notification:notification];
-    [deviceLock setProperty:@YES forKey:@"default"];
-    [specifiers addObject:deviceLock];
-
-    [specifiers addObjectsFromArray:[self appSpecifiers]];
-    return specifiers;
-}
-
-/// The subtitle a link row shows for the delay page.
-- (id)delayDescription:(PSSpecifier *)specifier {
-    NSInteger current = APLIntegerPreference(APLKeyForLockDelay(), 0);
-    NSUInteger index = [APLLockDelayValues() indexOfObject:@(current)];
-    return index == NSNotFound ? @"立即" : APLLockDelayTitles()[index];
-}
-
 #pragma mark - Rows
 
-- (PSSpecifier *)valueRowNamed:(NSString *)name key:(NSString *)key domain:(NSString *)domain notification:(NSString *)notification {
+- (PSSpecifier *)switchRowNamed:(NSString *)name key:(NSString *)key {
     PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:name
                                                             target:self
                                                                set:@selector(setPreferenceValue:specifier:)
@@ -219,8 +73,9 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
                                                               cell:PSSwitchCell
                                                               edit:nil];
     [specifier setProperty:key forKey:@"key"];
-    [specifier setProperty:domain forKey:@"defaults"];
-    [specifier setProperty:notification forKey:@"PostNotification"];
+    [specifier setProperty:APLPreferencesDomain() forKey:@"defaults"];
+    [specifier setProperty:@NO forKey:@"default"];
+    [specifier setProperty:APLChangedNotificationName() forKey:@"PostNotification"];
     return specifier;
 }
 
@@ -239,16 +94,12 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
                  forKey:@"footerText"];
     [specifiers addObject:header];
 
-    NSString *domain = APLPreferencesDomain();
-    NSString *notification = APLChangedNotificationName();
-
     for (LSApplicationProxy *app in apps) {
         NSString *bundleID = app.bundleIdentifier;
         NSString *name = app.localizedName.length ? app.localizedName : bundleID;
 
-        PSSpecifier *specifier = [self valueRowNamed:name key:APLKeyForBundle(bundleID) domain:domain notification:notification];
+        PSSpecifier *specifier = [self switchRowNamed:name key:APLKeyForBundle(bundleID)];
         [specifier setProperty:bundleID forKey:@"id"];
-        [specifier setProperty:@NO forKey:@"default"];
         UIImage *icon = [self iconForBundleID:bundleID];
         if (icon != nil) {
             [specifier setProperty:icon forKey:@"iconImage"];
