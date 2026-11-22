@@ -73,7 +73,7 @@ static NSString *sAppName;
 static BOOL sEnabled;
 static BOOL sProtected;
 static BOOL sLocked;
-static BOOL sPrompted;
+static BOOL sAuthAttemptStarted;
 static BOOL sPrepared;
 static BOOL sLockOnDeviceLock;
 static NSInteger sLockDelay;
@@ -221,6 +221,22 @@ static UIColor *APLAccentColor(void) {
     _autoAttempts = 0;
 }
 
+// Wait a moment, then try again while this lock screen is still up and tries
+// remain. Without this the three tries would need three separate triggers.
+- (void)scheduleAutomaticRetry {
+    if (_autoAttempts >= 3) {
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil || strongSelf.view.window == nil) {
+            return;  // unlocked, or the lock screen is gone
+        }
+        [strongSelf requestFaceIDAutomatic:YES];
+    });
+}
+
 // Three automatic tries per lock; after that the buttons are the way in, and
 // nothing pops up on its own.
 - (void)authenticate {
@@ -295,9 +311,11 @@ static UIColor *APLAccentColor(void) {
                 self.onUnlocked();
             }
         } else if (self->_requestWasAutomatic) {
-            // A failed automatic try hands over quietly to the user.
+            // A failed automatic try hands over quietly to the user, unless
+            // there are tries left.
             self->_autoAttempts += 1;
             [self setStatusText:nil];
+            [self scheduleAutomaticRetry];
         } else {
             [self setStatusText:@"面容 ID 未通过，可重试或使用密码"];
         }
@@ -313,6 +331,7 @@ static UIColor *APLAccentColor(void) {
         if (strongSelf->_requestWasAutomatic) {
             strongSelf->_autoAttempts += 1;
             [strongSelf setStatusText:nil];
+            [strongSelf scheduleAutomaticRetry];
         } else {
             [strongSelf setStatusText:@"面容 ID 没有回应，请重试"];
         }
@@ -428,7 +447,7 @@ static void APLShowLock(void) {
         controller.appName = sAppName;
         controller.onUnlocked = ^{
             sLocked = NO;
-            sPrompted = NO;
+            sAuthAttemptStarted = NO;
             os_log(TweakLog(), "unlocked %{public}s", sBundleID.UTF8String ?: "");
             if (sLockWindow == nil) {
                 return;
@@ -458,19 +477,29 @@ static void APLShowLock(void) {
 
 // Engage the lock. A new lock also gives Face ID its three automatic tries
 // again.
+static void APLPromptIfNeeded(void);  // only when the app is in front
+
 static void APLLockApp(void) {
     sLocked = YES;
-    sPrompted = NO;
+    sAuthAttemptStarted = NO;
     [sLockController resetAutoAttempts];
     APLShowLock();
+    APLPromptIfNeeded();
 }
 
+// One automatic attempt per lock, and only with the app in front: a prompt
+// asked for by a background app keeps the sensor running over whatever is on
+// screen.
 static void APLPromptIfNeeded(void) {
-    if (!sLocked || sPrompted || sLockController == nil) {
+    if (!sLocked || sAuthAttemptStarted || sLockController == nil) {
         return;
     }
-    sPrompted = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        os_log(TweakLog(), "not prompting: app is not in front");
+        return;
+    }
+    sAuthAttemptStarted = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (sLocked && sLockController != nil) {
             [sLockController authenticate];
         }
@@ -561,7 +590,7 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
     if (!(sEnabled && sProtected)) {
         if (sLocked) {
             sLocked = NO;
-            sPrompted = NO;
+            sAuthAttemptStarted = NO;
             APLHideLockWindow();
         }
         return;
@@ -645,7 +674,6 @@ static void APLInstallObservers(void) {
             return;
         }
         APLShowLock();
-        sPrompted = NO;
         APLPromptIfNeeded();
     }];
 
@@ -775,26 +803,52 @@ static void APLPublishAuthResult(NSString *bundleID, uint32_t token, BOOL grante
     notify_cancel(handle);
 }
 
+// One evaluation per app at a time: a second prompt over a live one leaves the
+// sensor scanning and makes the dialog close and come back on its own.
+static NSMutableDictionary<NSString *, LAContext *> *sAuthContexts;
+static NSMutableDictionary<NSString *, NSNumber *> *sAuthContextTokens;
+
 static void APLHandleAuthRequest(NSString *bundleID, int handle) {
     uint64_t state = 0;
     if (notify_get_state(handle, &state) != NOTIFY_STATUS_OK) {
         return;
     }
     uint32_t token = (uint32_t)state;
+
+    if (sAuthContexts == nil) {
+        sAuthContexts = [NSMutableDictionary dictionary];
+        sAuthContextTokens = [NSMutableDictionary dictionary];
+    }
+    NSNumber *running = sAuthContextTokens[bundleID];
+    if (running != nil) {
+        if (running.unsignedIntValue == token) {
+            os_log(TweakLog(), "ignoring a repeated Face ID request from %{public}s", bundleID.UTF8String);
+            return;  // the same request, asked twice
+        }
+        LAContext *stale = sAuthContexts[bundleID];
+        [sAuthContexts removeObjectForKey:bundleID];
+        [sAuthContextTokens removeObjectForKey:bundleID];
+        [stale invalidate];  // end the old prompt before starting another
+        APLPublishAuthResult(bundleID, running.unsignedIntValue, NO);
+    }
+
     os_log(TweakLog(), "Face ID requested by %{public}s", bundleID.UTF8String);
 
     LAContext *context = [[LAContext alloc] init];
     context.localizedCancelTitle = @"取消";
+    sAuthContexts[bundleID] = context;
+    sAuthContextTokens[bundleID] = @(token);
+
     NSString *reason = [NSString stringWithFormat:@"解锁“%@”", APLDisplayNameForBundle(bundleID)];
-    __block BOOL answered = NO;
     [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
             localizedReason:reason
                       reply:^(BOOL success, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (answered) {
-                return;
+            if (sAuthContexts[bundleID] != context) {
+                return;  // a newer request took over
             }
-            answered = YES;
+            [sAuthContexts removeObjectForKey:bundleID];
+            [sAuthContextTokens removeObjectForKey:bundleID];
             os_log(TweakLog(), "Face ID for %{public}s success=%d error=%{public}s",
                    bundleID.UTF8String, (int)success, error.localizedDescription.UTF8String ?: "(none)");
             APLPublishAuthResult(bundleID, token, success);
