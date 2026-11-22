@@ -46,6 +46,19 @@ static BOOL APLAuthServiceReady(void) {
 
 #pragma mark - The lock screen
 
+// Launch Services is private: declare only what is sent to it, so the class is
+// reached by name at run time.
+@interface APLLaunchServicesProxy : NSObject
++ (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
+- (NSString *)localizedName;
+- (NSString *)bundleIdentifier;
+@end
+
+@interface APLLaunchServicesWorkspace : NSObject
++ (instancetype)defaultWorkspace;
+- (NSArray *)allInstalledApplications;
+@end
+
 // The window that sits above the app until Face ID has passed.
 @interface APLLockViewController : UIViewController
 @property (nonatomic, copy) NSString *appName;
@@ -77,6 +90,7 @@ static UIColor *APLAccentColor(void) {
     UIButton *_passcodeButton;
     LAContext *_context;
     BOOL _authenticating;
+    BOOL _passcodeInFlight;
     BOOL _didPrompt;
     uint32_t _requestToken;
     int _resultHandle;
@@ -183,10 +197,14 @@ static UIColor *APLAccentColor(void) {
 }
 
 - (void)unlockTapped:(id)sender {
+    os_log(TweakLog(), "unlock button tapped");
     [self authenticate];
 }
 
 - (void)passcodeTapped:(id)sender {
+    os_log(TweakLog(), "passcode button tapped");
+    // A Face ID request nobody answered must not keep the passcode out.
+    _authenticating = NO;
     [self evaluatePasscode];
 }
 
@@ -263,7 +281,7 @@ static UIColor *APLAccentColor(void) {
     });
 
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (strongSelf == nil || !strongSelf->_authenticating || strongSelf->_requestToken != token) {
             return;
@@ -277,10 +295,11 @@ static UIColor *APLAccentColor(void) {
 
 // Safe in an app process: this policy asks for the passcode, not for Face ID.
 - (void)evaluatePasscode {
-    if (_authenticating) {
+    if (_passcodeInFlight) {
         return;
     }
-    _authenticating = YES;
+    _passcodeInFlight = YES;
+    _authenticating = NO;  // the passcode does not wait for a Face ID answer
     [self setStatusText:nil];
 
     LAContext *context = [[LAContext alloc] init];
@@ -289,7 +308,7 @@ static UIColor *APLAccentColor(void) {
 
     NSError *availability = nil;
     if (![context canEvaluatePolicy:LAPolicyDeviceOwnerAuthentication error:&availability]) {
-        _authenticating = NO;
+        _passcodeInFlight = NO;
         _context = nil;
         [self setStatusText:@"密码验证不可用"];
         return;
@@ -304,7 +323,7 @@ static UIColor *APLAccentColor(void) {
             if (strongSelf == nil) {
                 return;
             }
-            strongSelf->_authenticating = NO;
+            strongSelf->_passcodeInFlight = NO;
             strongSelf->_context = nil;
             os_log(TweakLog(), "passcode success=%d error=%{public}s", (int)success, error.localizedDescription.UTF8String ?: "(none)");
             if (success) {
@@ -374,7 +393,7 @@ static void APLShowLock(void) {
     }
     if (sLockWindow == nil) {
         sLockWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        sLockWindow.windowLevel = UIWindowLevelAlert + 100.0;
+        sLockWindow.windowLevel = UIWindowLevelAlert + 1000.0;
         sLockWindow.backgroundColor = [UIColor blackColor];
 
         APLLockViewController *controller = [[APLLockViewController alloc] init];
@@ -399,7 +418,9 @@ static void APLShowLock(void) {
     }
     sLockWindow.alpha = 1.0;
     sLockWindow.hidden = NO;
+    sLockWindow.windowLevel = UIWindowLevelAlert + 1000.0;
     APLPlaceLockWindow();
+    [sLockWindow makeKeyAndVisible];
     if (sLockWindow.windowScene == nil) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             APLPlaceLockWindow();
@@ -427,6 +448,22 @@ static NSString *APLHostDisplayName(void) {
     NSString *name = info[@"CFBundleDisplayName"];
     if (name.length == 0) {
         name = info[@"CFBundleName"];
+    }
+    if (name.length == 0) {
+        // Some apps keep their display name in a localized InfoPlist.strings
+        // only; Launch Services has it either way.
+        Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+        if (proxyClass == Nil) {
+            dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+            proxyClass = NSClassFromString(@"LSApplicationProxy");
+        }
+        if (proxyClass != Nil) {
+            id proxy = [(id)proxyClass applicationProxyForIdentifier:bundle.bundleIdentifier];
+            NSString *localized = [proxy localizedName];
+            if (localized.length > 0) {
+                return localized;
+            }
+        }
     }
     if (name.length == 0) {
         name = bundle.bundleIdentifier;
@@ -472,15 +509,15 @@ static NSInteger APLIntegerInDomain(NSDictionary *domain, NSString *key, NSInteg
     return fallback;
 }
 
-static void APLApplyDomain(NSDictionary *domain) {
-    if (sBundleID.length == 0 || domain == nil) {
+static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
+    if (sBundleID.length == 0) {
         return;
     }
     BOOL wasProtected = sProtected;
-    sEnabled = APLBoolInDomain(domain, APLKeyForEnabled(), YES);
-    sProtected = APLBoolInDomain(domain, APLKeyForBundle(sBundleID), NO);
-    sLockDelay = APLIntegerInDomain(domain, APLKeyForLockDelay(), 0);
-    sLockOnDeviceLock = APLBoolInDomain(domain, APLKeyForLockOnDeviceLock(), YES);
+    sEnabled = enabled;
+    sProtected = protected;
+    sLockDelay = domain != nil ? APLIntegerInDomain(domain, APLKeyForLockDelay(), 0) : 0;
+    sLockOnDeviceLock = domain != nil ? APLBoolInDomain(domain, APLKeyForLockOnDeviceLock(), YES) : YES;
     os_log(TweakLog(), "state enabled=%d protected=%d delay=%ld deviceLock=%d",
            (int)sEnabled, (int)sProtected, (long)sLockDelay, (int)sLockOnDeviceLock);
 
@@ -506,9 +543,31 @@ static void APLApplyDomain(NSDictionary *domain) {
     }
 }
 
-// The file is the only source the tweak trusts.
+// The pane sets this the instant a switch goes on, which is faster than the
+// settings file cfprefsd has not flushed yet.
+static BOOL APLNotifySaysProtected(NSString *bundleID) {
+    int handle = 0;
+    if (notify_register_check(APLProtectionStateName(bundleID).UTF8String, &handle) != NOTIFY_STATUS_OK) {
+        return NO;
+    }
+    uint64_t state = 0;
+    notify_get_state(handle, &state);
+    notify_cancel(handle);
+    return state == 1;
+}
+
 static void APLApplyStateFromFile(void) {
-    APLApplyDomain(APLReadSettingsFile());
+    if (sBundleID.length == 0) {
+        return;
+    }
+    NSDictionary *domain = APLReadSettingsFile();
+    BOOL enabled = domain != nil ? APLBoolInDomain(domain, APLKeyForEnabled(), YES) : YES;
+    BOOL protected = domain != nil ? APLBoolInDomain(domain, APLKeyForBundle(sBundleID), NO) : NO;
+    if (!protected && APLNotifySaysProtected(sBundleID)) {
+        os_log(TweakLog(), "protection came from the pane's signal");
+        protected = YES;
+    }
+    APLApplyDomain(domain, enabled, protected);
 }
 
 // The pane writes through cfprefsd, which flushes the file a moment after it
@@ -655,13 +714,6 @@ static void APLPrepareForHost(void) {
 
 #pragma mark - SpringBoard: the Face ID service
 
-// Launch Services is private: declare only what is sent to it, so the class is
-// reached by name at run time.
-@interface APLLaunchServicesProxy : NSObject
-+ (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
-- (NSString *)localizedName;
-@end
-
 // SpringBoard's entitlements carry kTCCServiceFaceID, so the biometric prompt
 // has to be asked for from here; the app tells this service which protected
 // app is waiting, over the Darwin names in Protect.h.
@@ -720,21 +772,44 @@ static void APLHandleAuthRequest(NSString *bundleID, int handle) {
     }];
 }
 
+static NSArray<NSString *> *APLAuthBundleIDs(void) {
+    NSMutableArray<NSString *> *bundleIDs = [NSMutableArray array];
+    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
+    if (workspaceClass != Nil) {
+        id workspace = [(id)workspaceClass defaultWorkspace];
+        NSArray *apps = [workspace allInstalledApplications];
+        for (id app in apps) {
+            NSString *bundleID = [(APLLaunchServicesProxy *)app bundleIdentifier];
+            if (bundleID.length > 0) {
+                [bundleIDs addObject:bundleID];
+            }
+        }
+    }
+    for (NSString *bundleID in APLProtectedBundleIDsInDomain(APLReadSettingsFile())) {
+        if (![bundleIDs containsObject:bundleID]) {
+            [bundleIDs addObject:bundleID];
+        }
+    }
+    return bundleIDs;
+}
+
 static void APLRefreshAuthListeners(void) {
     if (sAuthListeners == nil) {
         sAuthListeners = [NSMutableDictionary dictionary];
     }
-    NSArray<NSString *> *protectedBundleIDs = APLProtectedBundleIDsInDomain(APLReadSettingsFile());
-    os_log(TweakLog(), "auth service watching %lu protected app(s)", (unsigned long)protectedBundleIDs.count);
-    os_log(TweakLog(), "watched: %{public}s", [[protectedBundleIDs componentsJoinedByString:@","] UTF8String]);
+    // Every app, not only the protected ones: the pane may have just switched
+    // one on, and a request that arrives before this service heard about it
+    // would be lost.
+    NSArray<NSString *> *bundleIDs = APLAuthBundleIDs();
+    os_log(TweakLog(), "auth service listening for %lu app(s)", (unsigned long)bundleIDs.count);
 
     for (NSString *bundleID in [sAuthListeners allKeys]) {
-        if (![protectedBundleIDs containsObject:bundleID]) {
+        if (![bundleIDs containsObject:bundleID]) {
             notify_cancel([sAuthListeners[bundleID] intValue]);
             [sAuthListeners removeObjectForKey:bundleID];
         }
     }
-    for (NSString *bundleID in protectedBundleIDs) {
+    for (NSString *bundleID in bundleIDs) {
         if (sAuthListeners[bundleID] != nil) {
             continue;
         }

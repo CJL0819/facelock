@@ -70,6 +70,12 @@ static inline NSString *APLAuthResultName(NSString *bundleID) {
     return [NSString stringWithFormat:@"%@/auth/result/%@", APLPreferencesDomain(), bundleID];
 }
 
+/// The pane sets this to 1 the moment a switch goes on, so a protected app
+/// learns about it without waiting for cfprefsd to flush the settings file.
+static inline NSString *APLProtectionStateName(NSString *bundleID) {
+    return [NSString stringWithFormat:@"%@/protected/%@", APLPreferencesDomain(), bundleID];
+}
+
 /// SpringBoard's auth service publishes 1 here once it is listening, so a lock
 /// screen can tell "not ready" from "Face ID failed".
 static inline NSString *APLAuthServiceName(void) {

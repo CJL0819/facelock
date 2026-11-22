@@ -258,6 +258,7 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
 @implementation FaceLockPrefsRootListController {
     NSMutableArray<PSSpecifier *> *_appSpecifiers;
     NSMutableDictionary<NSString *, PSSpecifier *> *_appSpecifiersByBundleID;
+    NSMutableDictionary<NSString *, NSNumber *> * _stateHandles;
 }
 
 - (void)viewDidLoad {
@@ -307,10 +308,30 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
 
 - (void)setProtection:(BOOL)protection forBundleID:(NSString *)bundleID {
     APLSetBoolPreference(APLKeyForBundle(bundleID), protection);
+    [self publishProtectionState:protection forBundleID:bundleID];
     PSSpecifier *specifier = _appSpecifiersByBundleID[bundleID];
     if (specifier != nil) {
         [self reloadSpecifier:specifier];
     }
+}
+
+/// The settings file only reaches an app once cfprefsd flushes it; this Darwin
+/// name carries the change at once, and the tweak reads it before the file.
+- (void)publishProtectionState:(BOOL)protection forBundleID:(NSString *)bundleID {
+    if (bundleID.length == 0) {
+        return;
+    }
+    if (_stateHandles == nil) {
+        _stateHandles = [NSMutableDictionary dictionary];
+    }
+    int handle = [_stateHandles[bundleID] intValue];
+    if (handle == 0) {
+        if (notify_register_check(APLProtectionStateName(bundleID).UTF8String, &handle) != NOTIFY_STATUS_OK) {
+            return;
+        }
+        _stateHandles[bundleID] = @(handle);
+    }
+    notify_set_state(handle, protection ? 1 : 0);
 }
 
 #pragma mark - Rows
@@ -362,8 +383,20 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
         [specifiers addObject:specifier];
         [_appSpecifiers addObject:specifier];
         _appSpecifiersByBundleID[bundleID] = specifier;
+        [self publishProtectionState:APLBoolPreference(APLKeyForBundle(bundleID), NO) forBundleID:bundleID];
     }
     return specifiers;
+}
+
+/// Rows written by Preferences itself (the switches in the list) reach the same
+/// place as a toggle from the search results.
+- (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
+    [super setPreferenceValue:value specifier:specifier];
+    NSString *key = [specifier propertyForKey:@"key"];
+    if ([key isKindOfClass:[NSString class]] && [key hasPrefix:APLProtectedPrefix()]) {
+        NSString *bundleID = [key substringFromIndex:APLProtectedPrefix().length];
+        [self publishProtectionState:[value boolValue] forBundleID:bundleID];
+    }
 }
 
 #pragma mark - Launch Services
