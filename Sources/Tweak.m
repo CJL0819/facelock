@@ -107,7 +107,11 @@ static UIColor *APLAccentColor(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    self.view.backgroundColor = [UIColor colorWithWhite:0.04 alpha:1.0];
+    self.view.backgroundColor = [UIColor blackColor];
+
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
+    blur.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:blur];
 
     UIImageView *iconView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"faceid"]];
     iconView.tintColor = [UIColor whiteColor];
@@ -178,6 +182,10 @@ static UIColor *APLAccentColor(void) {
 
     UILayoutGuide *margins = self.view.layoutMarginsGuide;
     [NSLayoutConstraint activateConstraints:@[
+        [blur.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [blur.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [blur.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [blur.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [stack.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
         [stack.leadingAnchor constraintGreaterThanOrEqualToAnchor:margins.leadingAnchor],
         [stack.trailingAnchor constraintLessThanOrEqualToAnchor:margins.trailingAnchor],
@@ -412,12 +420,7 @@ static void APLAttachLockWindow(UIWindowScene *scene) {
     if (sLockWindow.windowScene != scene) {
         sLockWindow.windowScene = scene;
     }
-    // A few points of overdraw: the scene's bounds can shift by a hair while a
-    // system sheet animates in, and a window that matches it exactly then shows
-    // the app's own colour as a sliver along the top corners.
-    CGRect bounds = scene.coordinateSpace.bounds;
-    sLockWindow.frame = CGRectMake(bounds.origin.x - 6.0, bounds.origin.y - 6.0,
-                                   bounds.size.width + 12.0, bounds.size.height + 12.0);
+    sLockWindow.frame = scene.coordinateSpace.bounds;
     sLockWindow.hidden = NO;
 }
 
@@ -455,10 +458,13 @@ static void APLShowLock(void) {
             if (sLockWindow == nil) {
                 return;
             }
-            // Hide at once: a fade lets the app's own background show through,
-            // which reads as a flash at the screen's rounded corners.
-            sLockWindow.hidden = YES;
-            sLockWindow.alpha = 1.0;
+            [UIView animateWithDuration:0.2
+                             animations:^{
+                sLockWindow.alpha = 0.0;
+            } completion:^(BOOL __unused finished) {
+                sLockWindow.hidden = YES;
+                sLockWindow.alpha = 1.0;
+            }];
         };
         sLockWindow.rootViewController = controller;
         sLockController = controller;
@@ -494,12 +500,10 @@ static void APLPromptIfNeeded(void) {
     if (!sLocked || sAuthAttemptStarted || sLockController == nil) {
         return;
     }
-    // An app that is still coming up counts as in front: asking now lets the
-    // prompt and the launch run side by side. Only a backgrounded app is left
-    // alone, since a prompt it asked for would hold the sensor open over
-    // whatever is on screen.
-    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
-        os_log(TweakLog(), "not prompting: app is in the background");
+    // Only prompt with the app in front: a prompt a backgrounded app asked for
+    // would hold the sensor open over whatever is on screen.
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        os_log(TweakLog(), "not prompting: app is not in front");
         return;
     }
     sAuthAttemptStarted = YES;
@@ -673,9 +677,8 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
     sProtected = protected;
     sLockDelay = domain != nil ? APLIntegerInDomain(domain, APLKeyForLockDelay(), 0) : 0;
     sLockOnDeviceLock = domain != nil ? APLBoolInDomain(domain, APLKeyForLockOnDeviceLock(), YES) : YES;
-    os_log(TweakLog(), "state enabled=%d protected=%d delay=%ld deviceLock=%d appState=%ld",
-           (int)sEnabled, (int)sProtected, (long)sLockDelay, (int)sLockOnDeviceLock,
-           (long)[UIApplication sharedApplication].applicationState);
+    os_log(TweakLog(), "state enabled=%d protected=%d delay=%ld deviceLock=%d",
+           (int)sEnabled, (int)sProtected, (long)sLockDelay, (int)sLockOnDeviceLock);
 
     if (!(sEnabled && sProtected)) {
         APLClearUnlockRecord();
