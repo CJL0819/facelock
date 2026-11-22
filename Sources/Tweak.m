@@ -505,7 +505,7 @@ static void APLPromptIfNeeded(void) {
         return;
     }
     sAuthAttemptStarted = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (sLocked && sLockController != nil) {
             [sLockController authenticate];
         }
@@ -1097,6 +1097,14 @@ static void APLSetupSpringBoardService(void) {
                                                   usingBlock:^(NSNotification *__unused note) {
         APLPublishDeviceLockStamp();
     }];
+
+    // Warm the biometric service, so the first prompt after a launch does not
+    // pay for opening that connection.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        LAContext *warm = [[LAContext alloc] init];
+        NSError *warmError = nil;
+        [warm canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:&warmError];
+    });
 }
 
 #pragma mark - Hooking the app's launch
