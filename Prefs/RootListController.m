@@ -338,8 +338,9 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     return workspace;
 }
 
-/// The apps a person installed: App Store, TrollStore and sideloaded ones.
-/// System apps are left out, as asked.
+/// The apps a person can open: App Store, TrollStore, sideloaded ones and the
+/// system apps they may still want behind Face ID. Hidden apps, web clips and
+/// the like stay out.
 - (NSArray *)installedApps {
     id workspace = [self workspace];
     if (workspace == nil || ![workspace respondsToSelector:@selector(allInstalledApplications)]) {
@@ -360,8 +361,11 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
         if (bundleID.length == 0 || [bundleID isEqualToString:@"com.apple.springboard"]) {
             continue;
         }
-        if ([app respondsToSelector:@selector(applicationType)] && ![app.applicationType isEqualToString:@"User"]) {
-            continue;  // System apps stay out of the list.
+        if ([app respondsToSelector:@selector(applicationType)]) {
+            NSString *type = app.applicationType;
+            if (type.length > 0 && ![type isEqualToString:@"User"] && ![type isEqualToString:@"System"]) {
+                continue;  // Web clips, placeholders and internal bundles.
+            }
         }
         if ([app respondsToSelector:@selector(isHidden)] && app.isHidden) {
             continue;
