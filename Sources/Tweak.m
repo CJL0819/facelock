@@ -808,30 +808,7 @@ static void APLPublishAuthResult(NSString *bundleID, uint32_t token, BOOL grante
 static NSMutableDictionary<NSString *, LAContext *> *sAuthContexts;
 static NSMutableDictionary<NSString *, NSNumber *> *sAuthContextTokens;
 
-static void APLHandleAuthRequest(NSString *bundleID, int handle) {
-    uint64_t state = 0;
-    if (notify_get_state(handle, &state) != NOTIFY_STATUS_OK) {
-        return;
-    }
-    uint32_t token = (uint32_t)state;
-
-    if (sAuthContexts == nil) {
-        sAuthContexts = [NSMutableDictionary dictionary];
-        sAuthContextTokens = [NSMutableDictionary dictionary];
-    }
-    NSNumber *running = sAuthContextTokens[bundleID];
-    if (running != nil) {
-        if (running.unsignedIntValue == token) {
-            os_log(TweakLog(), "ignoring a repeated Face ID request from %{public}s", bundleID.UTF8String);
-            return;  // the same request, asked twice
-        }
-        LAContext *stale = sAuthContexts[bundleID];
-        [sAuthContexts removeObjectForKey:bundleID];
-        [sAuthContextTokens removeObjectForKey:bundleID];
-        [stale invalidate];  // end the old prompt before starting another
-        APLPublishAuthResult(bundleID, running.unsignedIntValue, NO);
-    }
-
+static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
     os_log(TweakLog(), "Face ID requested by %{public}s", bundleID.UTF8String);
 
     LAContext *context = [[LAContext alloc] init];
@@ -854,6 +831,43 @@ static void APLHandleAuthRequest(NSString *bundleID, int handle) {
             APLPublishAuthResult(bundleID, token, success);
         });
     }];
+}
+
+static void APLHandleAuthRequest(NSString *bundleID, int handle) {
+    uint64_t state = 0;
+    if (notify_get_state(handle, &state) != NOTIFY_STATUS_OK) {
+        return;
+    }
+    uint32_t token = (uint32_t)state;
+
+    if (sAuthContexts == nil) {
+        sAuthContexts = [NSMutableDictionary dictionary];
+        sAuthContextTokens = [NSMutableDictionary dictionary];
+    }
+    NSNumber *running = sAuthContextTokens[bundleID];
+    if (running != nil) {
+        if (running.unsignedIntValue == token) {
+            os_log(TweakLog(), "ignoring a repeated Face ID request from %{public}s", bundleID.UTF8String);
+            return;  // the same request, asked twice
+        }
+        LAContext *stale = sAuthContexts[bundleID];
+        [sAuthContexts removeObjectForKey:bundleID];
+        [sAuthContextTokens removeObjectForKey:bundleID];
+        [stale invalidate];  // close the dialog that is up
+        APLPublishAuthResult(bundleID, running.unsignedIntValue, NO);
+
+        // Give the dialog time to leave the screen before the next one opens,
+        // so a retry does not look like one dialog flickering into another.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (sAuthContextTokens[bundleID] != nil) {
+                return;  // another request arrived meanwhile
+            }
+            APLStartAuthEvaluation(bundleID, token);
+        });
+        return;
+    }
+
+    APLStartAuthEvaluation(bundleID, token);
 }
 
 static NSArray<NSString *> *APLAuthBundleIDs(void) {
