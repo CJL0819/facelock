@@ -107,11 +107,7 @@ static UIColor *APLAccentColor(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    self.view.backgroundColor = [UIColor blackColor];
-
-    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
-    blur.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:blur];
+    self.view.backgroundColor = [UIColor colorWithWhite:0.04 alpha:1.0];
 
     UIImageView *iconView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"faceid"]];
     iconView.tintColor = [UIColor whiteColor];
@@ -182,10 +178,6 @@ static UIColor *APLAccentColor(void) {
 
     UILayoutGuide *margins = self.view.layoutMarginsGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [blur.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-        [blur.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [blur.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [blur.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [stack.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
         [stack.leadingAnchor constraintGreaterThanOrEqualToAnchor:margins.leadingAnchor],
         [stack.trailingAnchor constraintLessThanOrEqualToAnchor:margins.trailingAnchor],
@@ -427,7 +419,12 @@ static void APLAttachLockWindow(UIWindowScene *scene) {
     if (sLockWindow.windowScene != scene) {
         sLockWindow.windowScene = scene;
     }
-    sLockWindow.frame = scene.coordinateSpace.bounds;
+    // Cover well past the screen: while a launch or a system sheet animates,
+    // the scene's bounds can differ by more than the rounded corners, and any
+    // gap lets the app's own base colour show at the top corners.
+    CGRect bounds = scene.coordinateSpace.bounds;
+    sLockWindow.frame = CGRectMake(bounds.origin.x - 120.0, bounds.origin.y - 120.0,
+                                   bounds.size.width + 240.0, bounds.size.height + 240.0);
     sLockWindow.hidden = NO;
 }
 
