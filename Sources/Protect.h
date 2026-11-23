@@ -34,8 +34,6 @@ static inline NSString *APLChangedNotificationName(void) {
 static inline NSString *APLKeyForEnabled(void) { return @"enabled"; }
 static inline NSString *APLKeyForLockDelay(void) { return @"backgroundLockDelay"; }
 static inline NSString *APLKeyForLockOnDeviceLock(void) { return @"lockOnDeviceLock"; }
-/// Draws the Face ID check as the island stretching instead of the system sheet.
-static inline NSString *APLKeyForSimpleFaceID(void) { return @"simpleFaceID"; }
 static inline NSString *APLKeyForBundle(NSString *bundleID) {
     return [@"protected." stringByAppendingString:bundleID.length ? bundleID : @""];
 }
@@ -89,6 +87,7 @@ static inline NSString *APLAuthResultName(NSString *bundleID) {
 static inline NSString *APLProtectionStateName(NSString *bundleID) {
     return [NSString stringWithFormat:@"%@/protected/%@", APLPreferencesDomain(), bundleID];
 }
+
 
 /// The pane asks here before it turns a lock off: Face ID from inside that app
 /// process is killed by TCC, so SpringBoard prompts for it. The request's state

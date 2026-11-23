@@ -64,6 +64,7 @@ static BOOL APLAuthServiceReady(void) {
 @interface APLLockViewController : UIViewController
 @property (nonatomic, copy) NSString *appName;
 @property (nonatomic, copy) void (^onUnlocked)(void);
+@property (nonatomic, copy) void (^onFailure)(void);
 - (void)authenticate;
 - (void)resetAutoAttempts;
 - (void)setStatusText:(NSString *)text;
@@ -80,6 +81,8 @@ static BOOL sFirstApply = YES;
 
 static void APLWriteUnlockRecord(uint64_t unlockedAt, uint64_t expiry);
 static void APLClearUnlockRecord(void);
+static void APLCancelAuthRequest(void);
+static BOOL APLWriteLockValue(NSString *key, id value);
 static uint64_t APLExpiryForCurrentSettings(void);
 static BOOL sLockOnDeviceLock;
 static NSInteger sLockDelay;
@@ -334,6 +337,9 @@ static UIColor *APLAccentColor(void) {
             [self scheduleAutomaticRetry];
         } else {
             [self setStatusText:@"面容 ID 未通过，可重试或使用密码"];
+        }
+        if (!granted && self.onFailure != nil) {
+            self.onFailure();
         }
     });
 
@@ -814,6 +820,7 @@ static void APLInstallObservers(void) {
             return;
         }
         sBackgroundDate = [NSDate date];
+        APLCancelAuthRequest();  // no Face ID over the home screen
         if (sLockDelay == 0) {
             APLLockApp();
         }
@@ -853,6 +860,22 @@ static void APLInstallObservers(void) {
             APLPlaceLockWindow();
         }
     }];
+}
+
+// Walking away from a page that is waiting on Face ID closes the dialog too:
+// otherwise the sensor keeps asking over whatever comes to the front next.
+static void APLCancelAuthRequest(void) {
+    if (sBundleID.length == 0) {
+        return;
+    }
+    int handle = 0;
+    NSString *name = APLAuthRequestName(sBundleID);
+    if (notify_register_check(name.UTF8String, &handle) != NOTIFY_STATUS_OK) {
+        return;
+    }
+    notify_set_state(handle, 0);
+    notify_post(name.UTF8String);
+    notify_cancel(handle);
 }
 
 static void APLStartListeningForChanges(void) {
@@ -934,8 +957,7 @@ static void APLPublishAuthResult(NSString *bundleID, uint32_t token, BOOL grante
 }
 
 // One evaluation per app at a time: a second prompt over a live one leaves the
-// sensor scanning and makes the dialog close and come back on its own. The slot
-// holds an LAContext, or the island's matcher when 简化面容识别动画 is on.
+// sensor scanning and makes the dialog close and come back on its own.
 static NSMutableDictionary<NSString *, id> *sAuthContexts;
 static NSMutableDictionary<NSString *, NSNumber *> *sAuthContextTokens;
 
@@ -991,6 +1013,19 @@ static void APLHandleAuthRequest(NSString *bundleID, int handle) {
     if (sAuthContexts == nil) {
         sAuthContexts = [NSMutableDictionary dictionary];
         sAuthContextTokens = [NSMutableDictionary dictionary];
+    }
+    if (token == 0) {
+        // The app walked away from its page: close the dialog rather than let it
+        // hang over the home screen.
+        LAContext *open = sAuthContexts[bundleID];
+        NSNumber *openToken = sAuthContextTokens[bundleID];
+        [sAuthContexts removeObjectForKey:bundleID];
+        [sAuthContextTokens removeObjectForKey:bundleID];
+        [open invalidate];
+        if (openToken != nil) {
+            APLPublishAuthResult(bundleID, openToken.unsignedIntValue, NO, NO);
+        }
+        return;
     }
     NSNumber *running = sAuthContextTokens[bundleID];
     if (running != nil) {
