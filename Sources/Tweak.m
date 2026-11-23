@@ -970,6 +970,11 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
             APLHideRemoteOverlay(YES);
         });
         APLHideRemoteOverlay(YES);
+        for (int tick = 0; tick < 12; tick++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 + tick * 0.15) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                APLHideRemoteOverlay(YES);
+            });
+        }
         APLIslandWorking();
         // TEMP: dump what SpringBoard puts up for this prompt.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1244,7 +1249,17 @@ static BOOL APLSimpleFaceIDEnabled(void) {
     _baseWidth = 126.0;
     CGFloat top = 11.0;
 
-    UIWindow *window = [[UIWindow alloc] initWithFrame:bounds];
+    UIWindow *window = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+            window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+            window.frame = bounds;
+            break;
+        }
+    }
+    if (window == nil) {
+        window = [[UIWindow alloc] initWithFrame:bounds];
+    }
     window.windowLevel = UIWindowLevelAlert + 200;
     window.backgroundColor = [UIColor clearColor];
     window.userInteractionEnabled = NO;
