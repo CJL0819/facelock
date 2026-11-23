@@ -64,7 +64,6 @@ static BOOL APLAuthServiceReady(void) {
 @interface APLLockViewController : UIViewController
 @property (nonatomic, copy) NSString *appName;
 @property (nonatomic, copy) void (^onUnlocked)(void);
-@property (nonatomic, copy) void (^onFailure)(void);
 - (void)authenticate;
 - (void)resetAutoAttempts;
 - (void)setStatusText:(NSString *)text;
@@ -337,9 +336,6 @@ static UIColor *APLAccentColor(void) {
             [self scheduleAutomaticRetry];
         } else {
             [self setStatusText:@"面容 ID 未通过，可重试或使用密码"];
-        }
-        if (!granted && self.onFailure != nil) {
-            self.onFailure();
         }
     });
 

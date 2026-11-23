@@ -88,7 +88,6 @@ static inline NSString *APLProtectionStateName(NSString *bundleID) {
     return [NSString stringWithFormat:@"%@/protected/%@", APLPreferencesDomain(), bundleID];
 }
 
-
 /// The pane asks here before it turns a lock off: Face ID from inside that app
 /// process is killed by TCC, so SpringBoard prompts for it. The request's state
 /// carries a token; the answer's state carries `token << 1 | granted`.
