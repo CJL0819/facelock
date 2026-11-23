@@ -977,29 +977,26 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
         }
         APLIslandWorking();
         // TEMP: dump what SpringBoard puts up for this prompt.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             NSMutableString *dump = [NSMutableString string];
             for (UIWindow *window in [UIApplication sharedApplication].windows) {
-                [dump appendFormat:@"win %s level %.0f hidden %d root %s\n", NSStringFromClass([window class]).UTF8String, window.windowLevel, (int)window.hidden, NSStringFromClass([window.rootViewController class]).UTF8String];
-                NSMutableArray *stack = [NSMutableArray array];
-                [stack addObject:@[window, @0]];
+                NSString *rootName = NSStringFromClass([window.rootViewController class]);
+                if (window.isHidden || ![rootName containsString:@"RemoteTransientOverlay"]) { continue; }
+                NSMutableArray *stack = [NSMutableArray arrayWithObject:@[window, @0]];
                 while (stack.count > 0) {
                     NSArray *pair = stack.lastObject;
                     [stack removeLastObject];
-                    UIView *view = pair[0];
+                    UIView *v = pair[0];
                     int depth = [pair[1] intValue];
-                    if (depth <= 5) {
-                        NSString *viewName = NSStringFromClass([view class]);
-                        if ([viewName containsString:@"Remote"] || [viewName containsString:@"LAUI"] || depth < 3) {
-                            [dump appendFormat:@"  %s %.0fx%.0f d%d\n", viewName.UTF8String, view.frame.size.width, view.frame.size.height, depth];
-                        }
-                        for (UIView *child in view.subviews) {
-                            [stack addObject:@[child, @(depth + 1)]];
-                        }
-                    }
+                    if (depth > 12) { continue; }
+                    UIColor *bg = v.backgroundColor; CGFloat r = 0, g = 0, b = 0, a = 0;
+                    [bg getRed:&r green:&g blue:&b alpha:&a];
+                    [dump appendFormat:@"%d %s %.0fx%.0f bg %.2f/%.2f/%.2f/%.2f alpha %.2f hidden %d layer %d corner %.0f\n",
+                     depth, NSStringFromClass([v class]).UTF8String, v.frame.size.width, v.frame.size.height, r, g, b, a, v.alpha, (int)v.hidden, (int)(v.layer.contents != nil), v.layer.cornerRadius];
+                    for (UIView *child in v.subviews) { [stack addObject:@[child, @(depth + 1)]]; }
                 }
             }
-            APLWriteLockValue(@"panelProbe", dump);
+            APLWriteLockValue(@"sbDump", dump);
         });
     }
     [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
@@ -1281,10 +1278,10 @@ static BOOL APLSimpleFaceIDEnabled(void) {
     pill.userInteractionEnabled = NO;
     [root.view addSubview:pill];
 
-    UIImage *padlock = [UIImage systemImageNamed:@"lock.open.fill"];
+    UIImage *padlock = [UIImage systemImageNamed:@"circle"];
     UIImageView *icon = [[UIImageView alloc] initWithImage:
                          [padlock imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]];
-    icon.tintColor = [UIColor whiteColor];
+    icon.tintColor = [UIColor colorWithRed:0.20 green:0.85 blue:0.45 alpha:1.0];
     icon.contentMode = UIViewContentModeScaleAspectFit;
     icon.alpha = 0.0;
     [pill addSubview:icon];
@@ -1313,7 +1310,7 @@ static BOOL APLSimpleFaceIDEnabled(void) {
                                       18.0,
                                       18.0);
         self->_icon.frame = iconFrame;
-        self->_icon.alpha = 0.55;
+        self->_icon.alpha = 1.0;
     } completion:nil];
 }
 
@@ -2104,18 +2101,13 @@ static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
     if (![name containsString:@"Pearl"]) {
         return;
     }
-    // Only the black backing goes: every layer above the pearl loses its fill,
-    // so the green ring and the tick stay on screen.
-    UIView *rootView = self.window.rootViewController.view;
-    UIView *ancestor = self.superview;
-    while (ancestor != nil && ancestor != rootView) {
-        ancestor.backgroundColor = [UIColor clearColor];
-        ancestor.layer.backgroundColor = [UIColor clearColor].CGColor;
-        ancestor = ancestor.superview;
+    // The black square is the pearl view itself, so it goes whole; the island
+    // draws the green ring and the tick in its place.
+    self.hidden = YES;
+    if (self.superview != nil) {
+        self.superview.hidden = YES;
     }
-    self.window.backgroundColor = [UIColor clearColor];
-    rootView.backgroundColor = [UIColor clearColor];
-    os_log(TweakLog(), "cleared the sheet backing");
+    os_log(TweakLog(), "hid the sheet");
 }
 
 static void APLSetupCoreAuthUIHiding(void) {
