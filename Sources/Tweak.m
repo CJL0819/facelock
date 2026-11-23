@@ -940,17 +940,10 @@ static NSMutableDictionary<NSString *, id> *sAuthContexts;
 static NSMutableDictionary<NSString *, NSNumber *> *sAuthContextTokens;
 
 static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token);
-static void APLStartIslandAuth(NSString *bundleID, uint32_t token);
 static BOOL APLWriteLockValue(NSString *key, id value);
-static void APLIslandWorking(void);
-static void APLIslandResult(BOOL success);
-static void APLIslandHide(void);
-static BOOL APLSimpleFaceIDEnabled(void);
 
 static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
     os_log(TweakLog(), "Face ID requested by %{public}s", bundleID.UTF8String);
-    // The island's own match is on hold: BiometricKit will not hand back a
-    // result to us yet, and probing it took SpringBoard down.
     APLStartAuthEvaluationWithLA(bundleID, token);
 }
 
@@ -961,14 +954,10 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
     sAuthContextTokens[bundleID] = @(token);
 
     NSString *reason = [NSString stringWithFormat:@"解锁“%@”", APLDisplayNameForBundle(bundleID)];
-    BOOL island = NO;
     [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
             localizedReason:reason
                       reply:^(BOOL success, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (island) {
-                APLIslandResult(success);
-            }
             if (sAuthContexts[bundleID] != context) {
                 return;  // a newer request took over
             }
@@ -985,9 +974,6 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
             return;  // answered, or replaced by a newer request
         }
         os_log(TweakLog(), "closing an unanswered Face ID dialog for %{public}s", bundleID.UTF8String);
-        if (island) {
-            APLIslandHide();
-        }
         [sAuthContexts removeObjectForKey:bundleID];
         [sAuthContextTokens removeObjectForKey:bundleID];
         [context invalidate];
@@ -1159,491 +1145,28 @@ static void APLPublishVerifyResult(uint32_t token, BOOL granted) {
     notify_post(APLVerifyResultName().UTF8String);
 }
 
-#pragma mark - The island's own Face ID check
-
-static void APLAskForVerification(NSString *reason, void (^answer)(BOOL granted));
-static void APLAskForVerificationWithSystemUI(NSString *reason, void (^answer)(BOOL granted));
-
-// With 简化面容识别动画 on, the check is done with BiometricKit directly, so iOS
-// never draws its own square sheet, and the island is stretched by us instead.
-
-static BOOL APLSimpleFaceIDEnabled(void) {
-    NSDictionary *domain = APLReadSettingsFile();
-    BOOL fromFile = domain != nil ? APLBoolInDomain(domain, APLKeyForSimpleFaceID(), NO) : NO;
-    // The sheet lives in CoreAuthUI, a sandboxed app: it may not reach the
-    // preferences file, so the same key is asked of cfprefsd as well.
-    CFBooleanRef cached = (CFBooleanRef)CFPreferencesCopyAppValue(
-        (CFStringRef)APLKeyForSimpleFaceID(), CFSTR("com.404.facelock"));
-    BOOL fromPrefs = cached != NULL ? CFBooleanGetValue(cached) : NO;
-    if (cached != NULL) {
-        CFRelease(cached);
-    }
-    if ([domain count] == 0) {
-        os_log(TweakLog(), "no settings file here; cfprefsd says %d", fromPrefs);
-    }
-    return fromFile || fromPrefs;
-}
-
-/// A black pill where the island is, grown to the right while the check runs,
-/// with the padlock on its right edge. Its height never changes.
-@interface APLIslandPrompt : NSObject
-+ (instancetype)shared;
-- (void)showWorking;
-- (void)showResult:(BOOL)success;
-- (void)hideSilently;
-@end
-
-@implementation APLIslandPrompt {
-    UIWindow *_window;
-    UIView *_pill;
-    UIImageView *_icon;
-    CGFloat _baseWidth;
-    CGFloat _height;
-}
-
-+ (instancetype)shared {
-    static APLIslandPrompt *prompt;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        prompt = [[APLIslandPrompt alloc] init];
-    });
-    return prompt;
-}
-
-- (void)buildIfNeeded {
-    if (_window != nil) {
-        return;
-    }
-    UIScreen *screen = [UIScreen mainScreen] ?: [UIScreen screens].firstObject;
-    CGRect bounds = screen.bounds;
-    // The island on this device: 126 x 37.33 at 11 pt from the top.
-    _height = 37.33;
-    _baseWidth = 126.0;
-    CGFloat top = 11.0;
-
-    UIWindow *window = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
-            window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
-            window.frame = bounds;
-            break;
-        }
-    }
-    if (window == nil) {
-        window = [[UIWindow alloc] initWithFrame:bounds];
-    }
-    window.windowLevel = UIWindowLevelAlert + 200;
-    window.backgroundColor = [UIColor clearColor];
-    window.userInteractionEnabled = NO;
-    UIViewController *root = [[UIViewController alloc] init];
-    root.view.backgroundColor = [UIColor clearColor];
-    root.view.userInteractionEnabled = NO;
-    window.rootViewController = root;
-    window.hidden = NO;
-
-    CGFloat width = _baseWidth;
-    UIView *pill = [[UIView alloc] initWithFrame:CGRectMake((bounds.size.width - width) / 2.0,
-                                                           top,
-                                                           width,
-                                                           _height)];
-    pill.backgroundColor = [UIColor blackColor];
-    pill.layer.cornerRadius = _height / 2.0;
-    pill.clipsToBounds = YES;
-    pill.userInteractionEnabled = NO;
-    [root.view addSubview:pill];
-
-    UIImage *padlock = [UIImage systemImageNamed:@"circle"];
-    UIImageView *icon = [[UIImageView alloc] initWithImage:
-                         [padlock imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]];
-    icon.tintColor = [UIColor colorWithRed:0.20 green:0.85 blue:0.45 alpha:1.0];
-    icon.contentMode = UIViewContentModeScaleAspectFit;
-    icon.alpha = 0.0;
-    [pill addSubview:icon];
-
-    _window = window;
-    _pill = pill;
-    _icon = icon;
-}
-
-- (void)showWorking {
-    [self buildIfNeeded];
-    UIScreen *screen = [UIScreen mainScreen] ?: [UIScreen screens].firstObject;
-    CGFloat width = 214.0;
-    [UIView animateWithDuration:0.28
-                          delay:0.0
-         usingSpringWithDamping:0.85
-          initialSpringVelocity:0.4
-                        options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{
-        CGRect frame = self->_pill.frame;
-        frame.size.width = width;
-        frame.origin.x = (screen.bounds.size.width - width) / 2.0;
-        self->_pill.frame = frame;
-        CGRect iconFrame = CGRectMake(width - self->_height - 8.0,
-                                      (self->_height - 18.0) / 2.0,
-                                      18.0,
-                                      18.0);
-        self->_icon.frame = iconFrame;
-        self->_icon.alpha = 1.0;
-    } completion:nil];
-}
-
-- (void)showResult:(BOOL)success {
-    if (_window == nil) {
-        return;
-    }
-    UIImage *image = [UIImage systemImageNamed:(success ? @"checkmark" : @"xmark")];
-    _icon.image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
-    _icon.tintColor = success ? [UIColor colorWithRed:0.20 green:0.85 blue:0.45 alpha:1.0]
-                              : [UIColor colorWithRed:1.0 green:0.35 blue:0.32 alpha:1.0];
-    _icon.alpha = 1.0;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [self hide];
-    });
-}
-
-- (void)hide {
-    UIScreen *screen = [UIScreen mainScreen] ?: [UIScreen screens].firstObject;
-    [UIView animateWithDuration:0.25
-                     animations:^{
-        CGRect frame = self->_pill.frame;
-        frame.size.width = self->_baseWidth;
-        frame.origin.x = (screen.bounds.size.width - self->_baseWidth) / 2.0;
-        self->_pill.frame = frame;
-        self->_icon.alpha = 0.0;
-    } completion:^(BOOL __unused finished) {
-        self->_window.hidden = YES;
-        self->_window = nil;
-        [self->_pill removeFromSuperview];
-        self->_pill = nil;
-        self->_icon = nil;
-    }];
-}
-
-- (void)hideSilently {
-    [self hide];
-}
-
-
-static void APLIslandWorking(void) {
-    [[APLIslandPrompt shared] showWorking];
-}
-
-static void APLIslandResult(BOOL success) {
-    [[APLIslandPrompt shared] showResult:success];
-}
-
-static void APLIslandHide(void) {
-    [[APLIslandPrompt shared] hideSilently];
-}
-@end
-
-/// Runs the match, telling the caller whether Face ID said yes. `unavailable`
-/// is set when the device would not start a match at all, so the caller can
-/// fall back to the system prompt.
-@interface APLBiometricMatcher : NSObject
-@property (nonatomic, copy) void (^completion)(BOOL success, BOOL unavailable);
-@property (nonatomic, strong) id operation;
-@property (nonatomic, strong) id device;
-@property (nonatomic, assign) BOOL finished;
-@end
-
-@implementation APLBiometricMatcher
-
-- (void)start {
-    // BiometricKit may check conformance before it calls back.
-    Protocol *clientProtocol = NSProtocolFromString(@"BiometricKitXPCClientDelegate");
-    if (clientProtocol != nil) {
-        class_addProtocol([APLBiometricMatcher class], clientProtocol);
-    }
-    Class managerClass = NSClassFromString(@"BKDeviceManager");
-    NSArray *devices = nil;
-    // BiometricKit answers with +availableDevices (and +availableDevicesWithFailure:).
-    SEL available = NSSelectorFromString(@"availableDevices");
-    if (managerClass != Nil && [managerClass respondsToSelector:available]) {
-        devices = ((id (*)(id, SEL))objc_msgSend)(managerClass, available);
-    } else {
-        SEL availableWithFailure = NSSelectorFromString(@"availableDevicesWithFailure:");
-        if (managerClass != Nil && [managerClass respondsToSelector:availableWithFailure]) {
-            BOOL failed = NO;
-            devices = ((id (*)(id, SEL, BOOL *))objc_msgSend)(managerClass, availableWithFailure, &failed);
-        }
-    }
-    if (![devices isKindOfClass:[NSArray class]] || devices.count == 0) {
-        os_log(TweakLog(), "no biometric device (%{public}s), falling back", [[devices description] UTF8String] ?: "nil");
-        [self finish:NO unavailable:YES];
-        return;
-    }
-    os_log(TweakLog(), "biometric device %{public}s", [[devices.firstObject description] UTF8String] ?: "nil");
-    // availableDevices hands back descriptors; the device is built from one.
-    id descriptor = devices.firstObject;
-    Class deviceClass = NSClassFromString(@"BKDevice");
-    id device = nil;
-    SEL withDescriptor = NSSelectorFromString(@"deviceWithDescriptor:error:");
-    if (deviceClass != Nil && [deviceClass respondsToSelector:withDescriptor]) {
-        NSError *error = nil;
-        device = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(deviceClass, withDescriptor, descriptor, &error);
-        os_log(TweakLog(), "device from descriptor %{public}s error %{public}s",
-               [[device description] UTF8String] ?: "nil", error.localizedDescription.UTF8String ?: "(none)");
-    }
-    if (device == nil && deviceClass != Nil) {
-        device = [[deviceClass alloc] init];
-        SEL setDescriptor = NSSelectorFromString(@"setDescriptor:");
-        if ([device respondsToSelector:setDescriptor]) {
-            [device performSelector:setDescriptor withObject:descriptor];
-        }
-    }
-    if (device == nil) {
-        os_log(TweakLog(), "no device built from the descriptor");
-        [self finish:NO unavailable:YES];
-        return;
-    }
-    SEL createSelector = NSSelectorFromString(@"createMatchOperationWithError:");
-    if (![device respondsToSelector:createSelector]) {
-        os_log(TweakLog(), "device cannot create a match operation");
-        [self finish:NO unavailable:YES];
-        return;
-    }
-    NSError *error = nil;
-    id operation = ((id (*)(id, SEL, NSError **))objc_msgSend)(device, createSelector, &error);
-    if (operation == nil) {
-        os_log(TweakLog(), "cannot create the match operation: %{public}s",
-               error.localizedDescription.UTF8String ?: "(none)");
-        [self finish:NO unavailable:YES];
-        return;
-    }
-    self.operation = operation;
-    self.device = device;
-    if ([operation respondsToSelector:NSSelectorFromString(@"setDelegate:")]) {
-        [operation performSelector:NSSelectorFromString(@"setDelegate:") withObject:self];
-    }
-    // The XPC client callbacks may come to the device's delegate instead.
-    if ([device respondsToSelector:NSSelectorFromString(@"setDelegate:")]) {
-        [device performSelector:NSSelectorFromString(@"setDelegate:") withObject:self];
-    }
-    if ([operation respondsToSelector:NSSelectorFromString(@"setQueue:")]) {
-        [operation performSelector:NSSelectorFromString(@"setQueue:") withObject:dispatch_get_main_queue()];
-    }
-    SEL startSelector = NSSelectorFromString(@"startWithError:");
-    if (![operation respondsToSelector:startSelector]) {
-        [self finish:NO unavailable:YES];
-        return;
-    }
-    NSError *startError = nil;
-    BOOL started = ((BOOL (*)(id, SEL, NSError **))objc_msgSend)(operation, startSelector, &startError);
-    os_log(TweakLog(), "island match started=%d error=%{public}s",
-           (int)started, startError.localizedDescription.UTF8String ?: "(none)");
-    if (!started) {
-        [self finish:NO unavailable:YES];
-        return;
-    }
-    // Never leave the person stuck: if nothing comes back, the system prompt is
-    // asked instead.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (self.finished) {
-            return;
-        }
-        os_log(TweakLog(), "match timed out");
-        if ([self.operation respondsToSelector:NSSelectorFromString(@"cancel")]) {
-            [self.operation performSelector:NSSelectorFromString(@"cancel")];
-        }
-        [self finish:NO unavailable:YES];
-    });
-}
-
-- (void)finish:(BOOL)success unavailable:(BOOL)unavailable {
-    if (self.finished) {
-        return;
-    }
-    self.finished = YES;
-    self.operation = nil;
-    void (^completion)(BOOL, BOOL) = self.completion;
-    self.completion = nil;
-    if (completion != nil) {
-        completion(success, unavailable);
-    }
-}
-
-- (void)stopOperation {
-    if ([self.operation respondsToSelector:NSSelectorFromString(@"cancel")]) {
-        [self.operation performSelector:NSSelectorFromString(@"cancel")];
-    }
-}
-
-// BiometricKit's delegate callbacks. Success is result 1 (BKMatchResultSuccess).
-- (void)matchResult:(id)resultInfo details:(id __unused)details client:(id __unused)client {
-    NSInteger result = 0;
-    if ([resultInfo respondsToSelector:NSSelectorFromString(@"result")]) {
-        result = [[resultInfo performSelector:NSSelectorFromString(@"result")] integerValue];
-    }
-    os_log(TweakLog(), "match result %ld", (long)result);
-    if (result == 1) {
-        [self stopOperation];
-        [self finish:YES unavailable:NO];
-    }
-}
-
-- (void)operationEndsWithReason:(NSInteger)reason {
-    os_log(TweakLog(), "match ended, reason %ld", (long)reason);
-    [self finish:NO unavailable:NO];
-}
-
-- (void)operationInterrupted {
-    os_log(TweakLog(), "match interrupted");
-    [self finish:NO unavailable:NO];
-}
-
-/// Drops the check without answering: the watchdog has answered already.
-- (void)abandon {
-    self.finished = YES;
-    self.completion = nil;
-    [self stopOperation];
-    self.operation = nil;
-}
-
-// TEMP: log whatever BiometricKit calls back with, so the real delegate
-// selectors show up in the log.
-- (BOOL)respondsToSelector:(SEL)selector {
-    if ([super respondsToSelector:selector]) {
-        return YES;
-    }
-    // BiometricKit checks before it calls; claim the callback-shaped ones.
-    NSString *name = NSStringFromSelector(selector);
-    if ([name containsString:@"match"] || [name containsString:@"operation"] || [name containsString:@"device"]) {
-        return YES;
-    }
-    return NO;
-}
-
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
-    NSString *name = NSStringFromSelector(selector);
-    if ([name containsString:@"match"] || [name containsString:@"operation"] || [name containsString:@"device"]) {
-        return [NSMethodSignature signatureWithObjCTypes:"v@:@"];
-    }
-    return [super methodSignatureForSelector:selector];
-}
-
-- (void)forwardInvocation:(NSInvocation *)invocation {
-    os_log(TweakLog(), "bk callback %{public}s", NSStringFromSelector(invocation.selector).UTF8String);
-}
-
-/// The one callback BiometricKit does send: ask how the operation went.
-- (void)operation:(id __unused)operation stateChanged:(NSInteger)state {
-    os_log(TweakLog(), "operation state %ld", (long)state);
-    if (state < 2 || self.finished) {
-        return;  // still running
-    }
-    SEL lastEvent = NSSelectorFromString(@"lastMatchEventWithError:");
-    if (self.device == nil || ![self.device respondsToSelector:lastEvent]) {
-        [self finish:NO unavailable:NO];
-        return;
-    }
-    NSError *error = nil;
-    id event = ((id (*)(id, SEL, NSError **))objc_msgSend)(self.device, lastEvent, &error);
-    NSInteger result = 0;
-    if ([event respondsToSelector:NSSelectorFromString(@"result")]) {
-        result = [[event performSelector:NSSelectorFromString(@"result")] integerValue];
-    }
-    os_log(TweakLog(), "match event result %ld error %{public}s",
-           (long)result, error.localizedDescription.UTF8String ?: "(none)");
-    [self finish:(result == 1) unavailable:NO];
-}
-
-@end
-
-static APLBiometricMatcher *sIslandMatcher;
-
-/// A protected app's request, answered from the island instead of the system
-/// sheet. Falls back to the system sheet when the match cannot even start.
-static void APLStartIslandAuth(NSString *bundleID, uint32_t token) {
-    APLIslandPrompt *prompt = [APLIslandPrompt shared];
-    [prompt showWorking];
-    APLBiometricMatcher *matcher = [[APLBiometricMatcher alloc] init];
-    sAuthContexts[bundleID] = matcher;
-    sAuthContextTokens[bundleID] = @(token);
-    matcher.completion = ^(BOOL success, BOOL unavailable) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (sAuthContexts[bundleID] != matcher) {
-                return;  // answered, or a newer request took over
-            }
-            [sAuthContexts removeObjectForKey:bundleID];
-            [sAuthContextTokens removeObjectForKey:bundleID];
-            if (unavailable) {
-                [prompt hideSilently];
-                os_log(TweakLog(), "island check unavailable for %{public}s", bundleID.UTF8String);
-                APLStartAuthEvaluationWithLA(bundleID, token);
-                return;
-            }
-            [prompt showResult:success];
-            APLPublishAuthResult(bundleID, token, success, NO);
-        });
-    };
-    [matcher start];
-
-    // One attempt gets three seconds, as the system sheet did.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (sAuthContexts[bundleID] != matcher) {
-            return;
-        }
-        os_log(TweakLog(), "island check timed out for %{public}s", bundleID.UTF8String);
-        [sAuthContexts removeObjectForKey:bundleID];
-        [sAuthContextTokens removeObjectForKey:bundleID];
-        [matcher abandon];
-        [prompt hideSilently];
-        APLPublishAuthResult(bundleID, token, NO, NO);
-    });
-}
-
-static void APLAskWithIsland(void (^answer)(BOOL success, BOOL unavailable)) {
-    APLIslandPrompt *prompt = [APLIslandPrompt shared];
-    [prompt showWorking];
-    APLBiometricMatcher *matcher = [[APLBiometricMatcher alloc] init];
-    sIslandMatcher = matcher;
-    matcher.completion = ^(BOOL success, BOOL unavailable) {
-        sIslandMatcher = nil;
-        if (!unavailable) {
-            [prompt showResult:success];
-        } else {
-            [prompt showResult:NO];
-        }
-        answer(success, unavailable);
-    };
-    [matcher start];
-}
+#pragma mark - Asking the person to confirm
 
 static void APLAskForVerification(NSString *reason, void (^answer)(BOOL granted)) {
-    // The island's own match is on hold for now; the system prompt answers.
-    APLAskForVerificationWithSystemUI(reason, answer);
-}
-
-static void APLAskForVerificationWithSystemUI(NSString *reason, void (^answer)(BOOL granted)) {
     LAContext *context = [[LAContext alloc] init];
     context.localizedFallbackTitle = @"使用密码";
     [context evaluatePolicy:LAPolicyDeviceOwnerAuthentication
             localizedReason:reason
                       reply:^(BOOL success, NSError *error) {
-        os_log(TweakLog(), "verification success=%d error=%{public}s",
-               (int)success, error.localizedDescription.UTF8String ?: "(none)");
-        answer(success);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            os_log(TweakLog(), "verification %d %{public}s", (int)success,
+                   error.localizedDescription.UTF8String ?: "(none)");
+            if (answer != nil) {
+                answer(success);
+            }
+        });
     }];
-}
-
-static BOOL APLWriteLockValue(NSString *key, id value);
-
-static void (*OriginalLAUIViewDidMoveToWindow)(UIView *self, SEL _cmd);
-
-static void HookedLAUIViewDidMoveToWindow(UIView *self, SEL _cmd) {
-    if (OriginalLAUIViewDidMoveToWindow != NULL) {
-        OriginalLAUIViewDidMoveToWindow(self, _cmd);
-    }
-    os_log(TweakLog(), "lauhook %{public}s in window=%d", NSStringFromClass([self class]).UTF8String, (int)(self.window != nil));
 }
 
 static void APLSetupSpringBoardService(void) {
     static int changeToken;
     APLRefreshAuthListeners();
+
     notify_register_dispatch(APLChangedNotificationName().UTF8String, &changeToken, dispatch_get_main_queue(), ^(int __unused note) {
         os_log(TweakLog(), "settings changed, refreshing the auth service");
         // Take the new app in at once, and again once cfprefsd has flushed the
@@ -1713,36 +1236,6 @@ static void APLSetupSpringBoardService(void) {
 
 
 
-    // TEMP: which Face ID UI classes this system has.
-    {
-        NSMutableString *list = [NSMutableString string];
-        int classCount = objc_getClassList(NULL, 0);
-        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)classCount);
-        classCount = objc_getClassList(classes, classCount);
-        for (int index = 0; index < classCount; index++) {
-            const char *name = class_getName(classes[index]);
-            if (strcasestr(name, "pearl") || strcasestr(name, "faceid") ||
-                strcasestr(name, "laui") || strcasestr(name, "biometric")) {
-                [list appendFormat:@"%s ", name];
-            }
-        }
-        free(classes);
-        APLWriteLockValue(@"faceClasses", list);
-    }
-
-    // Watch the system Face ID views come into a window.
-    for (NSString *className in @[@"LAUIPearlGlyphView", @"LAUIAuthenticationView",
-                                  @"LAUIPasscodeView", @"LAUIPhysicalButtonView"]) {
-        Class cls = NSClassFromString(className);
-        if (cls == Nil) {
-            os_log(TweakLog(), "lauhook %{public}s missing", className.UTF8String);
-            continue;
-        }
-        MSHookMessageEx(cls, @selector(didMoveToWindow), (IMP)HookedLAUIViewDidMoveToWindow, (IMP *)&OriginalLAUIViewDidMoveToWindow);
-        os_log(TweakLog(), "lauhook %{public}s hooked", className.UTF8String);
-    }
-
-    // A long press on a home screen icon offers a switch for that app's lock.
     Class iconViewClass = NSClassFromString(@"SBIconView");
     if (iconViewClass != Nil) {
         MSHookMessageEx(iconViewClass,
