@@ -1206,9 +1206,8 @@ static void APLAskForVerificationWithSystemUI(NSString *reason, void (^answer)(B
 // never draws its own square sheet, and the island is stretched by us instead.
 
 static BOOL APLSimpleFaceIDEnabled(void) {
-    // On hold: the sheet's black card is drawn by the system's presentation
-    // container, which cannot be taken off the screen from here.
-    return NO;
+    NSDictionary *domain = APLReadSettingsFile();
+    return domain != nil ? APLBoolInDomain(domain, APLKeyForSimpleFaceID(), NO) : NO;
 }
 
 /// A black pill where the island is, grown to the right while the check runs,
@@ -2071,6 +2070,7 @@ static void (*OriginalAnyViewDidMoveToWindow)(UIView *self, SEL _cmd);
 
 /// Hides the pearl glyph the system animates while it looks for a face. The
 /// passcode view stays: a failed match must still be recoverable.
+static CGFloat sSheetWindowLevel;
 static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
     if (OriginalAnyViewDidMoveToWindow != NULL) {
         OriginalAnyViewDidMoveToWindow(self, _cmd);
@@ -2092,23 +2092,27 @@ static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
             view.hidden = NO;
         }
         [restore removeAllObjects];
-        if (self.window.hidden) {
-            self.window.hidden = NO;
+        if (sSheetWindowLevel != 0) {
+            self.window.windowLevel = sSheetWindowLevel;
         }
-        self.window.alpha = 1.0;
         os_log(TweakLog(), "showed the sheet for the passcode");
         return;
     }
     if (![name containsString:@"Pearl"]) {
         return;
     }
-    // The black square is the pearl view itself, so it goes whole; the island
-    // draws the green ring and the tick in its place.
-    self.hidden = YES;
-    if (self.superview != nil) {
-        self.superview.hidden = YES;
+    // The whole sheet lives in its own window: push that window behind
+    // everything, so the black card and the pearl leave the screen while the
+    // check itself keeps running in this process.
+    static CGFloat savedLevel;
+    static BOOL levelSaved;
+    if (!levelSaved) {
+        savedLevel = self.window.windowLevel;
+        levelSaved = YES;
     }
-    os_log(TweakLog(), "hid the sheet");
+    sSheetWindowLevel = savedLevel;
+    self.window.windowLevel = -1000.0;
+    os_log(TweakLog(), "pushed the sheet window behind everything");
 }
 
 static void APLSetupCoreAuthUIHiding(void) {

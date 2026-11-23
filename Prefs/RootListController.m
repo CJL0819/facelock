@@ -362,6 +362,11 @@ static BOOL APLAskSpringBoardToVerify(void) {
         }
         [specifiers insertObject:delay atIndex:insertAt];
 
+        PSSpecifier *simpleFaceID = [self switchRowNamed:@"简化面容识别动画"
+                                                     key:APLKeyForSimpleFaceID()];
+        [simpleFaceID setProperty:@"以灵动岛横向拉伸代替系统的方形面容面板，右侧显示解锁图标。"
+                       forKey:@"footerText"];
+        [specifiers insertObject:simpleFaceID atIndex:insertAt + 1];
 
         [specifiers addObjectsFromArray:[self appSpecifiers]];
         _specifiers = specifiers;
