@@ -934,13 +934,25 @@ static void APLPublishAuthResult(NSString *bundleID, uint32_t token, BOOL grante
 }
 
 // One evaluation per app at a time: a second prompt over a live one leaves the
-// sensor scanning and makes the dialog close and come back on its own.
-static NSMutableDictionary<NSString *, LAContext *> *sAuthContexts;
+// sensor scanning and makes the dialog close and come back on its own. The slot
+// holds an LAContext, or the island's matcher when 简化面容识别动画 is on.
+static NSMutableDictionary<NSString *, id> *sAuthContexts;
 static NSMutableDictionary<NSString *, NSNumber *> *sAuthContextTokens;
+
+static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token);
+static void APLStartIslandAuth(NSString *bundleID, uint32_t token);
+static BOOL APLSimpleFaceIDEnabled(void);
 
 static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
     os_log(TweakLog(), "Face ID requested by %{public}s", bundleID.UTF8String);
+    if (APLSimpleFaceIDEnabled()) {
+        APLStartIslandAuth(bundleID, token);
+        return;
+    }
+    APLStartAuthEvaluationWithLA(bundleID, token);
+}
 
+static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
     LAContext *context = [[LAContext alloc] init];
     context.localizedCancelTitle = @"取消";
     sAuthContexts[bundleID] = context;
@@ -1160,6 +1172,7 @@ static BOOL APLSimpleFaceIDEnabled(void) {
 + (instancetype)shared;
 - (void)showWorking;
 - (void)showResult:(BOOL)success;
+- (void)hideSilently;
 @end
 
 @implementation APLIslandPrompt {
@@ -1278,6 +1291,10 @@ static BOOL APLSimpleFaceIDEnabled(void) {
         self->_pill = nil;
         self->_icon = nil;
     }];
+}
+
+- (void)hideSilently {
+    [self hide];
 }
 
 @end
@@ -1403,9 +1420,58 @@ static BOOL APLSimpleFaceIDEnabled(void) {
     [self finish:NO unavailable:NO];
 }
 
+/// Drops the check without answering: the watchdog has answered already.
+- (void)abandon {
+    self.finished = YES;
+    self.completion = nil;
+    [self stopOperation];
+    self.operation = nil;
+}
+
 @end
 
 static APLBiometricMatcher *sIslandMatcher;
+
+/// A protected app's request, answered from the island instead of the system
+/// sheet. Falls back to the system sheet when the match cannot even start.
+static void APLStartIslandAuth(NSString *bundleID, uint32_t token) {
+    APLIslandPrompt *prompt = [APLIslandPrompt shared];
+    [prompt showWorking];
+    APLBiometricMatcher *matcher = [[APLBiometricMatcher alloc] init];
+    sAuthContexts[bundleID] = matcher;
+    sAuthContextTokens[bundleID] = @(token);
+    matcher.completion = ^(BOOL success, BOOL unavailable) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (sAuthContexts[bundleID] != matcher) {
+                return;  // answered, or a newer request took over
+            }
+            [sAuthContexts removeObjectForKey:bundleID];
+            [sAuthContextTokens removeObjectForKey:bundleID];
+            if (unavailable) {
+                [prompt hideSilently];
+                os_log(TweakLog(), "island check unavailable for %{public}s", bundleID.UTF8String);
+                APLStartAuthEvaluationWithLA(bundleID, token);
+                return;
+            }
+            [prompt showResult:success];
+            APLPublishAuthResult(bundleID, token, success, NO);
+        });
+    };
+    [matcher start];
+
+    // One attempt gets three seconds, as the system sheet did.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (sAuthContexts[bundleID] != matcher) {
+            return;
+        }
+        os_log(TweakLog(), "island check timed out for %{public}s", bundleID.UTF8String);
+        [sAuthContexts removeObjectForKey:bundleID];
+        [sAuthContextTokens removeObjectForKey:bundleID];
+        [matcher abandon];
+        [prompt hideSilently];
+        APLPublishAuthResult(bundleID, token, NO, NO);
+    });
+}
 
 static void APLAskWithIsland(void (^answer)(BOOL success, BOOL unavailable)) {
     APLIslandPrompt *prompt = [APLIslandPrompt shared];
