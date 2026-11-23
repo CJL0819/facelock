@@ -1016,6 +1016,7 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
             [sAuthContextTokens removeObjectForKey:bundleID];
             os_log(TweakLog(), "Face ID for %{public}s success=%d error=%{public}s",
                    bundleID.UTF8String, (int)success, error.localizedDescription.UTF8String ?: "(none)");
+            APLHideRemoteOverlay(NO);
             APLPublishAuthResult(bundleID, token, success, error.code == LAErrorUserCancel);
         });
     }];
@@ -1363,17 +1364,9 @@ static void APLIslandResult(BOOL success) {
 }
 
 static void APLHideRemoteOverlay(BOOL hide) {
-    for (UIWindow *window in [UIApplication sharedApplication].windows) {
-        NSString *root = NSStringFromClass([window.rootViewController class]);
-        if (![root containsString:@"RemoteTransientOverlay"]) {
-            continue;
-        }
-        if (window.hidden == hide) {
-            continue;
-        }
-        window.hidden = hide;
-        os_log(TweakLog(), "remote overlay hidden=%d", (int)hide);
-    }
+    // The sheet's own process clears its black backing; leaving the SpringBoard
+    // overlay alone keeps the system's green ring and tick on screen.
+    (void)hide;
 }
 
 static void APLIslandHide(void) {
@@ -2104,39 +2097,25 @@ static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
         if (self.window.hidden) {
             self.window.hidden = NO;
         }
+        self.window.alpha = 1.0;
         os_log(TweakLog(), "showed the sheet for the passcode");
         return;
     }
     if (![name containsString:@"Pearl"]) {
         return;
     }
-    // The sheet is mirrored into SpringBoard as a remote view, so only the
-    // views themselves can be taken off it: hide the pearl and every layer
-    // around it, up to the sheet's root, leaving the passcode its place.
-    static NSMutableArray<UIView *> *hidden;
-    if (hidden == nil) {
-        hidden = [NSMutableArray array];
-    }
+    // Only the black backing goes: every layer above the pearl loses its fill,
+    // so the green ring and the tick stay on screen.
     UIView *rootView = self.window.rootViewController.view;
+    UIView *ancestor = self.superview;
+    while (ancestor != nil && ancestor != rootView) {
+        ancestor.backgroundColor = [UIColor clearColor];
+        ancestor.layer.backgroundColor = [UIColor clearColor].CGColor;
+        ancestor = ancestor.superview;
+    }
     self.window.backgroundColor = [UIColor clearColor];
     rootView.backgroundColor = [UIColor clearColor];
-    UIView *view = self;
-    while (view != nil && view != rootView) {
-        if (!view.hidden) {
-            view.hidden = YES;
-            [hidden addObject:view];
-        }
-        if (view.superview != rootView && view.superview != nil) {
-            for (UIView *sibling in view.superview.subviews) {
-                if (sibling != view && !sibling.hidden) {
-                    sibling.hidden = YES;
-                    [hidden addObject:sibling];
-                }
-            }
-        }
-        view = view.superview;
-    }
-    os_log(TweakLog(), "hid the sheet (%lu views)", (unsigned long)hidden.count);
+    os_log(TweakLog(), "cleared the sheet backing");
 }
 
 static void APLSetupCoreAuthUIHiding(void) {
