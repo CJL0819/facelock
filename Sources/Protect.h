@@ -39,6 +39,18 @@ static inline NSString *APLKeyForBundle(NSString *bundleID) {
 }
 static inline NSString *APLProtectedPrefix(void) { return @"protected."; }
 
+/// A home screen folder the person locked from its own long press menu, keyed
+/// by the folder's identifier as SpringBoard gives it.
+static inline NSString *APLKeyForFolder(NSString *folderID) {
+    return [@"folderlocked." stringByAppendingString:folderID.length ? folderID : @""];
+}
+
+/// When that folder was last opened after Face ID, so the delay the pane sets
+/// applies to folders the way it applies to apps.
+static inline NSString *APLKeyForFolderUnlock(NSString *folderID) {
+    return [@"folderunlocked." stringByAppendingString:folderID.length ? folderID : @""];
+}
+
 /// The bundle ids a settings domain marks as protected, from the file's own
 /// `protected.<bundle id>` keys.
 static inline NSArray<NSString *> *APLProtectedBundleIDsInDomain(NSDictionary *domain) {
@@ -74,6 +86,17 @@ static inline NSString *APLAuthResultName(NSString *bundleID) {
 /// learns about it without waiting for cfprefsd to flush the settings file.
 static inline NSString *APLProtectionStateName(NSString *bundleID) {
     return [NSString stringWithFormat:@"%@/protected/%@", APLPreferencesDomain(), bundleID];
+}
+
+/// The pane asks here before it turns a lock off: Face ID from inside that app
+/// process is killed by TCC, so SpringBoard prompts for it. The request's state
+/// carries a token; the answer's state carries `token << 1 | granted`.
+static inline NSString *APLVerifyRequestName(void) {
+    return [APLPreferencesDomain() stringByAppendingString:@"/auth/verify"];
+}
+
+static inline NSString *APLVerifyResultName(void) {
+    return [APLPreferencesDomain() stringByAppendingString:@"/auth/verify-result"];
 }
 
 /// SpringBoard stamps the moment the device locked here; an app compares it

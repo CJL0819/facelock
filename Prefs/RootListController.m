@@ -20,6 +20,9 @@
 
 #import "Protect.h"
 
+/// Asks SpringBoard for Face ID or the passcode; see its definition below.
+static BOOL APLAskSpringBoardToVerify(void);
+
 // Launch Services is private: declare only what is sent to it.
 @interface LSApplicationProxy : NSObject
 @property (nonatomic, readonly) NSString *bundleIdentifier;
@@ -58,6 +61,15 @@ static CFStringRef APLDomain(void) {
 }
 
 static BOOL APLBoolPreference(NSString *key, BOOL fallback) {
+    // The long press menu writes the settings file from SpringBoard, so the
+    // file is what both the tweak and this pane go by; cfprefsd may still hold
+    // the value from before that write.
+    NSString *path = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", APLDomain()];
+    NSDictionary *fileDomain = [NSDictionary dictionaryWithContentsOfFile:path];
+    id fileValue = fileDomain[key];
+    if ([fileValue respondsToSelector:@selector(boolValue)]) {
+        return [fileValue boolValue];
+    }
     CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key, APLDomain());
     if (value == NULL) {
         return fallback;
@@ -80,11 +92,11 @@ static void APLSetBoolPreference(NSString *key, BOOL value) {
 
 /// The choices the 后台锁定时机 row offers, in seconds (-1: never).
 static NSArray<NSNumber *> *APLLockDelayValues(void) {
-    return @[@0, @30, @60, @300, @600, @-1];
+    return @[@0, @30, @60, @120, @300, @600, @-1];
 }
 
 static NSArray<NSString *> *APLLockDelayTitles(void) {
-    return @[@"立即", @"30 秒后", @"1 分钟后", @"5 分钟后", @"10 分钟后", @"不锁定"];
+    return @[@"立即", @"30 秒后", @"1 分钟后", @"2 分钟后", @"5 分钟后", @"10 分钟后", @"不锁定"];
 }
 
 static NSInteger APLIntegerPreference(NSString *key, NSInteger fallback) {
@@ -244,11 +256,66 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     if (row < 0 || row >= (NSInteger)_matches.count) {
         return;
     }
+    BOOL on = sender.on;
+    if (!on) {
+        sender.on = YES;  // back to "protected" while the prompt is up
+        if (!APLAskSpringBoardToVerify()) {
+            return;
+        }
+    }
     LSApplicationProxy *app = _matches[(NSUInteger)row];
-    [_parent setProtection:sender.on forBundleID:app.bundleIdentifier];
+    [_parent setProtection:on forBundleID:app.bundleIdentifier];
+    sender.on = [_parent isProtectedBundleID:app.bundleIdentifier];
 }
 
 @end
+
+/// Turning a lock off is what a person would do with the phone in someone
+/// else's hands, so it takes Face ID or the passcode. This app cannot prompt
+/// itself: TCC kills an app process that asks for Face ID. SpringBoard asks.
+static BOOL APLAskSpringBoardToVerify(void) {
+    int serviceHandle = 0;
+    uint64_t serviceState = 0;
+    if (notify_register_check(APLAuthServiceName().UTF8String, &serviceHandle) != NOTIFY_STATUS_OK) {
+        return NO;
+    }
+    notify_get_state(serviceHandle, &serviceState);
+    notify_cancel(serviceHandle);
+    if (serviceState != 1) {
+        return NO;  // nothing in SpringBoard to ask
+    }
+
+    int requestHandle = 0;
+    int resultHandle = 0;
+    if (notify_register_check(APLVerifyRequestName().UTF8String, &requestHandle) != NOTIFY_STATUS_OK) {
+        return NO;
+    }
+    if (notify_register_check(APLVerifyResultName().UTF8String, &resultHandle) != NOTIFY_STATUS_OK) {
+        notify_cancel(requestHandle);
+        return NO;
+    }
+
+    uint32_t token = (uint32_t)arc4random();
+    if (token == 0) {
+        token = 1;
+    }
+    notify_set_state(requestHandle, (uint64_t)token);
+    notify_post(APLVerifyRequestName().UTF8String);
+
+    BOOL granted = NO;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:90.0];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        uint64_t state = 0;
+        if (notify_get_state(resultHandle, &state) == NOTIFY_STATUS_OK && (uint32_t)(state >> 1) == token) {
+            granted = (state & 1) != 0;
+            break;
+        }
+        [NSThread sleepForTimeInterval:0.15];
+    }
+    notify_cancel(requestHandle);
+    notify_cancel(resultHandle);
+    return granted;
+}
 
 #pragma mark - The pane
 
@@ -259,6 +326,7 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
     NSMutableArray<PSSpecifier *> *_appSpecifiers;
     NSMutableDictionary<NSString *, PSSpecifier *> *_appSpecifiersByBundleID;
     NSMutableDictionary<NSString *, NSNumber *> * _stateHandles;
+    BOOL _applyingVerifiedChange;
 }
 
 - (void)viewDidLoad {
@@ -389,10 +457,29 @@ static void APLSetIntegerPreference(NSString *key, NSInteger value) {
 }
 
 /// Rows written by Preferences itself (the switches in the list) reach the same
-/// place as a toggle from the search results.
+/// place as a toggle from the search results. Turning one off takes Face ID or
+/// the passcode first; turning one on does not.
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
-    [super setPreferenceValue:value specifier:specifier];
     NSString *key = [specifier propertyForKey:@"key"];
+    BOOL isLockSwitch = [key isKindOfClass:[NSString class]] &&
+        ([key hasPrefix:APLProtectedPrefix()] || [key isEqualToString:APLKeyForEnabled()]);
+    if (isLockSwitch && !_applyingVerifiedChange && ![value boolValue]) {
+        // Put the switch back while the prompt is up, so it never reads "off"
+        // before the answer comes.
+        [self reloadSpecifier:specifier];
+        if (!APLAskSpringBoardToVerify()) {
+            return;
+        }
+        _applyingVerifiedChange = YES;
+        [self setPreferenceValue:value specifier:specifier];
+        _applyingVerifiedChange = NO;
+        // The cell drew itself before the answer came, so draw it again now
+        // that the value is the one that was asked for.
+        [self reloadSpecifier:specifier];
+        return;
+    }
+
+    [super setPreferenceValue:value specifier:specifier];
     if ([key isKindOfClass:[NSString class]] && [key hasPrefix:APLProtectedPrefix()]) {
         NSString *bundleID = [key substringFromIndex:APLProtectedPrefix().length];
         [self publishProtectionState:[value boolValue] forBundleID:bundleID];

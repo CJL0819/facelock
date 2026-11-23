@@ -750,7 +750,11 @@ static void APLApplyStateFromFile(void) {
     NSDictionary *domain = APLReadSettingsFile();
     BOOL enabled = domain != nil ? APLBoolInDomain(domain, APLKeyForEnabled(), YES) : YES;
     BOOL protected = domain != nil ? APLBoolInDomain(domain, APLKeyForBundle(sBundleID), NO) : NO;
-    if (!protected && APLNotifySaysProtected(sBundleID)) {
+    // The pane's signal covers the moment before cfprefsd has flushed the file.
+    // Once the file holds a value for this app, that value is the answer: a
+    // signal left over from an earlier switch off would lock it for good.
+    BOOL fileSaysIt = domain != nil && domain[APLKeyForBundle(sBundleID)] != nil;
+    if (!protected && !fileSaysIt && APLNotifySaysProtected(sBundleID)) {
         os_log(TweakLog(), "protection came from the pane's signal");
         protected = YES;
     }
@@ -776,11 +780,10 @@ static void APLInstallObservers(void) {
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *__unused note) {
-        if (!sEnabled || !sProtected) {
-            // Protection may have been switched on while this app waited in
-            // the background: read the settings again before deciding.
-            APLApplyStateFromFile();
-        }
+        // Read the settings again on every return to the front: a switch turned
+        // off from the home screen's menu must end the lock even though this
+        // process still remembers being protected.
+        APLApplyStateFromFile();
         if (!sEnabled || !sProtected) {
             return;
         }
@@ -1088,6 +1091,38 @@ static void APLPublishDeviceLockStamp(void) {
 
 
 
+static UIContextMenuConfiguration *(*OriginalIconContextMenu)(id self, SEL _cmd, id interaction, CGPoint location);
+static id HookedIconContextMenu(id self, SEL _cmd, id interaction, CGPoint location);
+static void (*OriginalOpenFolder)(id self, SEL _cmd, id folderIcon, id location, BOOL animated, id completion);
+static void HookedOpenFolder(id self, SEL _cmd, id folderIcon, id location, BOOL animated, id completion);
+static NSString *APLFolderIdentifierForIconView(id iconView);
+
+/// SpringBoard's answer to the pane's "may I turn this lock off".
+static void APLPublishVerifyResult(uint32_t token, BOOL granted) {
+    static int handle;
+    if (handle == 0 && notify_register_check(APLVerifyResultName().UTF8String, &handle) != NOTIFY_STATUS_OK) {
+        os_log(TweakLog(), "cannot publish the verify answer");
+        handle = 0;
+        return;
+    }
+    notify_set_state(handle, ((uint64_t)token << 1) | (granted ? 1 : 0));
+    notify_post(APLVerifyResultName().UTF8String);
+}
+
+/// Face ID or the passcode, asked before a lock is turned off. SpringBoard can
+/// prompt where an app process cannot: TCC kills an app that asks for Face ID.
+static void APLAskForVerification(NSString *reason, void (^answer)(BOOL granted)) {
+    LAContext *context = [[LAContext alloc] init];
+    context.localizedFallbackTitle = @"使用密码";
+    [context evaluatePolicy:LAPolicyDeviceOwnerAuthentication
+            localizedReason:reason
+                      reply:^(BOOL success, NSError *error) {
+        os_log(TweakLog(), "verification success=%d error=%{public}s",
+               (int)success, error.localizedDescription.UTF8String ?: "(none)");
+        answer(success);
+    }];
+}
+
 static void APLSetupSpringBoardService(void) {
     static int changeToken;
     APLRefreshAuthListeners();
@@ -1098,6 +1133,25 @@ static void APLSetupSpringBoardService(void) {
         APLRefreshAuthListeners();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             APLRefreshAuthListeners();
+        });
+    });
+
+    // The pane asks here before it turns a lock off.
+    static int verifyHandle;
+    static uint32_t lastVerifyToken;
+    notify_register_dispatch(APLVerifyRequestName().UTF8String, &verifyHandle, dispatch_get_main_queue(), ^(int stateHandle) {
+        uint64_t state = 0;
+        if (notify_get_state(stateHandle, &state) != NOTIFY_STATUS_OK) {
+            return;
+        }
+        uint32_t token = (uint32_t)state;
+        if (token == 0 || token == lastVerifyToken) {
+            return;
+        }
+        lastVerifyToken = token;
+        os_log(TweakLog(), "asked to verify turning a lock off, token %u", token);
+        APLAskForVerification(@"关闭应用面容锁", ^(BOOL granted) {
+            APLPublishVerifyResult(token, granted);
         });
     });
 
@@ -1136,6 +1190,274 @@ static void APLSetupSpringBoardService(void) {
         LAContext *warm = [[LAContext alloc] init];
         NSError *warmError = nil;
         [warm canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:&warmError];
+    });
+
+    // A long press on a home screen icon offers a switch for that app's lock.
+    Class iconViewClass = NSClassFromString(@"SBIconView");
+    if (iconViewClass != Nil) {
+        MSHookMessageEx(iconViewClass,
+                        sel_registerName("contextMenuInteraction:configurationForMenuAtLocation:"),
+                        (IMP)HookedIconContextMenu,
+                        (IMP *)&OriginalIconContextMenu);
+    } else {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            Class lateClass = NSClassFromString(@"SBIconView");
+            if (lateClass != Nil) {
+                MSHookMessageEx(lateClass,
+                                sel_registerName("contextMenuInteraction:configurationForMenuAtLocation:"),
+                                (IMP)HookedIconContextMenu,
+                                (IMP *)&OriginalIconContextMenu);
+            }
+        });
+    }
+
+    // A folder holding a protected app opens only after Face ID.
+    Class iconManagerClass = NSClassFromString(@"SBHIconManager");
+    if (iconManagerClass != Nil) {
+        MSHookMessageEx(iconManagerClass,
+                        sel_registerName("openFolderIcon:location:animated:withCompletion:"),
+                        (IMP)HookedOpenFolder,
+                        (IMP *)&OriginalOpenFolder);
+    }
+}
+
+#pragma mark - The home screen's long press menu
+
+// The icon's app. A folder or a widget answers nothing, and keeps the item off.
+static NSString *APLBundleIdentifierForIconView(id iconView) {
+    if (![iconView respondsToSelector:sel_registerName("icon")]) {
+        return nil;
+    }
+    id icon = [iconView performSelector:sel_registerName("icon")];
+    if (icon == nil) {
+        return nil;
+    }
+    if (![icon respondsToSelector:sel_registerName("application")]) {
+        return nil;
+    }
+    id application = [icon performSelector:sel_registerName("application")];
+    if (application == nil || ![application respondsToSelector:sel_registerName("bundleIdentifier")]) {
+        return nil;
+    }
+    id bundleID = [application performSelector:sel_registerName("bundleIdentifier")];
+    return [bundleID isKindOfClass:[NSString class]] && [bundleID length] > 0 ? bundleID : nil;
+}
+
+/// The long press menu writes this from SpringBoard, so it publishes the app's
+/// protection state too: an app that is running reads that name as quickly as
+/// the settings file, and a stale "protected" there would keep it locked.
+static void APLPublishProtectionState(NSString *bundleID, BOOL on) {
+    static NSMutableDictionary<NSString *, NSNumber *> *handles;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        handles = [NSMutableDictionary dictionary];
+    });
+    int handle = [handles[bundleID] intValue];
+    if (handle == 0) {
+        if (notify_register_check(APLProtectionStateName(bundleID).UTF8String, &handle) != NOTIFY_STATUS_OK) {
+            return;
+        }
+        handles[bundleID] = @(handle);
+    }
+    notify_set_state(handle, on ? 1 : 0);
+    notify_post(APLProtectionStateName(bundleID).UTF8String);
+}
+
+// The domain the pane writes, written the way the tweak reads it. cfprefsd keeps
+// its own copy, so the toggle reaches the apps through the changed notification.
+static BOOL APLWriteLockValue(NSString *key, id value);
+
+static BOOL APLWriteLockKey(NSString *key, BOOL on) {
+    return APLWriteLockValue(key, @(on));
+}
+
+static BOOL APLWriteLockValue(NSString *key, id value) {
+    NSString *name = [APLPreferencesDomain() stringByAppendingString:@".plist"];
+    NSString *path = ApelinBootstrapPath([@"/var/mobile/Library/Preferences/" stringByAppendingString:name]);
+    if (path.length == 0) {
+        path = [@"/var/mobile/Library/Preferences/" stringByAppendingString:name];
+    }
+    NSMutableDictionary *domain = [NSMutableDictionary dictionaryWithDictionary:APLReadSettingsFile() ?: @{}];
+    domain[key] = value;
+    if (![domain writeToFile:path atomically:YES]) {
+        os_log(TweakLog(), "the quick toggle could not save %{public}s", key.UTF8String);
+        return NO;
+    }
+    notify_post(APLChangedNotificationName().UTF8String);
+    return YES;
+}
+
+static void APLWriteProtectionForBundle(NSString *bundleID, BOOL on) {
+    if (APLWriteLockKey(APLKeyForBundle(bundleID), on)) {
+        APLPublishProtectionState(bundleID, on);
+        os_log(TweakLog(), "quick toggle %{public}s protected=%d", bundleID.UTF8String, (int)on);
+    }
+}
+
+static id HookedIconContextMenu(id self, SEL _cmd, id interaction, CGPoint location) {
+    UIContextMenuConfiguration *configuration = OriginalIconContextMenu(self, _cmd, interaction, location);
+    if (configuration == nil) {
+        return nil;
+    }
+    NSString *bundleID = APLBundleIdentifierForIconView(self);
+    NSString *folderID = bundleID.length == 0 ? APLFolderIdentifierForIconView(self) : nil;
+    if (bundleID.length == 0 && folderID.length == 0) {
+        return configuration;
+    }
+
+    @try {
+        id originalProvider = [configuration valueForKey:@"actionProvider"];
+        if (originalProvider == nil) {
+            return configuration;
+        }
+        BOOL isOn = bundleID.length > 0
+            ? APLBoolInDomain(APLReadSettingsFile(), APLKeyForBundle(bundleID), NO)
+            : APLBoolInDomain(APLReadSettingsFile(), APLKeyForFolder(folderID), NO);
+        NSString *onTitle = bundleID.length > 0 ? @"开启应用面容锁" : @"锁定文件夹";
+        NSString *offTitle = bundleID.length > 0 ? @"关闭应用面容锁" : @"取消文件夹锁定";
+        NSString *reason = bundleID.length > 0 ? @"关闭应用面容锁" : @"取消文件夹锁定";
+        UIImage *itemImage = [UIImage systemImageNamed:(bundleID.length > 0 ? @"faceid" : @"lock.fill")];
+        UIMenu *(^originalMenu)(void) = originalProvider;
+        id provider = ^UIMenu *(void) {
+            UIMenu *menu = originalMenu();
+            UIAction *action = [UIAction actionWithTitle:(isOn ? offTitle : onTitle)
+                                                   image:itemImage
+                                              identifier:nil
+                                                 handler:^(UIAction *__unused tapped) {
+                if (!isOn) {
+                    if (bundleID.length > 0) {
+                        APLWriteProtectionForBundle(bundleID, YES);
+                    } else {
+                        APLWriteLockKey(APLKeyForFolder(folderID), YES);
+                        os_log(TweakLog(), "folder locked, %{public}s", folderID.UTF8String);
+                    }
+                    return;
+                }
+                APLAskForVerification(reason, ^(BOOL granted) {
+                    if (!granted) {
+                        return;
+                    }
+                    if (bundleID.length > 0) {
+                        APLWriteProtectionForBundle(bundleID, NO);
+                    } else {
+                        APLWriteLockKey(APLKeyForFolder(folderID), NO);
+                        os_log(TweakLog(), "folder unlocked, %{public}s", folderID.UTF8String);
+                    }
+                });
+            }];
+            NSMutableArray *children = [NSMutableArray array];
+            if (menu != nil) {
+                [children addObjectsFromArray:menu.children];
+            }
+            // Last, not first: the first section of an icon's menu sits against
+            // the app preview, where a tap may open the app instead.
+            [children addObject:action];
+            if (menu != nil) {
+                return [menu menuByReplacingChildren:children];
+            }
+            return [UIMenu menuWithTitle:@"" children:children];
+        };
+        return [UIContextMenuConfiguration configurationWithIdentifier:[configuration identifier]
+                                                      previewProvider:[configuration valueForKey:@"previewProvider"]
+                                                       actionProvider:provider];
+    } @catch (NSException *exception) {
+        os_log(TweakLog(), "the long press menu kept its own actions: %{public}s", exception.reason.UTF8String ?: "");
+        return configuration;
+    }
+}
+
+#pragma mark - The home screen's folders
+
+/// What a folder is called in the settings domain: SpringBoard's own name for
+/// the folder when it has one, its display name otherwise.
+static NSString *APLFolderIdentifierForIconView(id iconView) {
+    if (iconView == nil) {
+        return nil;
+    }
+    // Called with an icon view from the menu, and with the folder icon itself
+    // when a folder is being opened.
+    id icon = iconView;
+    if ([iconView respondsToSelector:sel_registerName("icon")]) {
+        icon = [iconView performSelector:sel_registerName("icon")];
+    }
+    if (icon == nil || ![icon respondsToSelector:sel_registerName("folder")]) {
+        return nil;
+    }
+    id folder = [icon performSelector:sel_registerName("folder")];
+    if (folder == nil) {
+        return nil;
+    }
+    for (NSString *selectorName in @[@"uniqueIdentifier", @"folderIdentifier", @"displayName"]) {
+        SEL selector = sel_registerName(selectorName.UTF8String);
+        if (![folder respondsToSelector:selector]) {
+            continue;
+        }
+        id value = [folder performSelector:selector];
+        if ([value isKindOfClass:[NSString class]] && [value length] > 0) {
+            return value;
+        }
+    }
+    return nil;
+}
+
+static BOOL APLFolderIsLocked(NSString *folderID) {
+    if (folderID.length == 0) {
+        return NO;
+    }
+    return APLBoolInDomain(APLReadSettingsFile(), APLKeyForFolder(folderID), NO);
+}
+
+/// The pane's 后台锁定时机, read the way an app reads it: 0 asks every time,
+/// a positive number is the grace after a Face ID, -1 lasts until the device
+/// locks. A device lock ends the grace in every case.
+static BOOL APLFolderGraceHolds(NSString *folderID, NSDictionary *domain) {
+    id stored = domain[APLKeyForFolderUnlock(folderID)];
+    if (![stored respondsToSelector:@selector(unsignedLongLongValue)]) {
+        return NO;
+    }
+    uint64_t unlockedAt = [stored unsignedLongLongValue];
+    if (unlockedAt == 0) {
+        return NO;
+    }
+    if (APLDeviceLockStamp() > unlockedAt) {
+        return NO;
+    }
+    NSInteger delay = APLIntegerInDomain(domain, APLKeyForLockDelay(), 0);
+    if (delay == 0) {
+        return NO;
+    }
+    if (delay < 0) {
+        return YES;
+    }
+    return (uint64_t)[NSDate date].timeIntervalSince1970 < unlockedAt + (uint64_t)delay;
+}
+
+static void HookedOpenFolder(id self, SEL _cmd, id folderIcon, id location, BOOL animated, id completion) {
+    NSDictionary *domain = APLReadSettingsFile();
+    BOOL enabled = domain != nil ? APLBoolInDomain(domain, APLKeyForEnabled(), YES) : YES;
+    NSString *folderID = APLFolderIdentifierForIconView(folderIcon);
+    if (!enabled || !APLFolderIsLocked(folderID)) {
+        OriginalOpenFolder(self, _cmd, folderIcon, location, animated, completion);
+        return;
+    }
+    if (APLFolderGraceHolds(folderID, domain)) {
+        // Opened a moment ago, inside the wait the pane set: no prompt.
+        OriginalOpenFolder(self, _cmd, folderIcon, location, animated, completion);
+        return;
+    }
+    // Face ID first: a refused answer leaves the folder shut.
+    APLAskForVerification(@"打开锁定的文件夹", ^(BOOL granted) {
+        if (!granted) {
+            os_log(TweakLog(), "folder stayed shut");
+            return;
+        }
+        APLWriteLockValue(APLKeyForFolderUnlock(folderID),
+                          @((uint64_t)[NSDate date].timeIntervalSince1970));
+        // The answer arrives on a background queue, and opening a folder builds
+        // views: back to the main queue first.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            OriginalOpenFolder(self, _cmd, folderIcon, location, animated, completion);
+        });
     });
 }
 
