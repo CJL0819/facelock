@@ -941,10 +941,12 @@ static NSMutableDictionary<NSString *, NSNumber *> *sAuthContextTokens;
 
 static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token);
 static void APLStartIslandAuth(NSString *bundleID, uint32_t token);
+static BOOL APLWriteLockValue(NSString *key, id value);
 static void APLIslandWorking(void);
 static void APLIslandResult(BOOL success);
 static void APLIslandHide(void);
 static BOOL APLSimpleFaceIDEnabled(void);
+static void APLHideRemoteOverlay(BOOL hide);
 
 static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
     os_log(TweakLog(), "Face ID requested by %{public}s", bundleID.UTF8String);
@@ -964,7 +966,36 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
     // shows the check instead.
     BOOL island = APLSimpleFaceIDEnabled();
     if (island) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            APLHideRemoteOverlay(YES);
+        });
+        APLHideRemoteOverlay(YES);
         APLIslandWorking();
+        // TEMP: dump what SpringBoard puts up for this prompt.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSMutableString *dump = [NSMutableString string];
+            for (UIWindow *window in [UIApplication sharedApplication].windows) {
+                [dump appendFormat:@"win %s level %.0f hidden %d root %s\n", NSStringFromClass([window class]).UTF8String, window.windowLevel, (int)window.hidden, NSStringFromClass([window.rootViewController class]).UTF8String];
+                NSMutableArray *stack = [NSMutableArray array];
+                [stack addObject:@[window, @0]];
+                while (stack.count > 0) {
+                    NSArray *pair = stack.lastObject;
+                    [stack removeLastObject];
+                    UIView *view = pair[0];
+                    int depth = [pair[1] intValue];
+                    if (depth <= 5) {
+                        NSString *viewName = NSStringFromClass([view class]);
+                        if ([viewName containsString:@"Remote"] || [viewName containsString:@"LAUI"] || depth < 3) {
+                            [dump appendFormat:@"  %s %.0fx%.0f d%d\n", viewName.UTF8String, view.frame.size.width, view.frame.size.height, depth];
+                        }
+                        for (UIView *child in view.subviews) {
+                            [stack addObject:@[child, @(depth + 1)]];
+                        }
+                    }
+                }
+            }
+            APLWriteLockValue(@"panelProbe", dump);
+        });
     }
     [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
             localizedReason:reason
@@ -1314,6 +1345,20 @@ static void APLIslandWorking(void) {
 
 static void APLIslandResult(BOOL success) {
     [[APLIslandPrompt shared] showResult:success];
+}
+
+static void APLHideRemoteOverlay(BOOL hide) {
+    for (UIWindow *window in [UIApplication sharedApplication].windows) {
+        NSString *root = NSStringFromClass([window.rootViewController class]);
+        if (![root containsString:@"RemoteTransientOverlay"]) {
+            continue;
+        }
+        if (window.hidden == hide) {
+            continue;
+        }
+        window.hidden = hide;
+        os_log(TweakLog(), "remote overlay hidden=%d", (int)hide);
+    }
 }
 
 static void APLIslandHide(void) {
@@ -1875,7 +1920,7 @@ static id HookedIconContextMenu(id self, SEL _cmd, id interaction, CGPoint locat
                         APLWriteLockKey(APLKeyForFolder(folderID), NO);
                         os_log(TweakLog(), "folder unlocked, %{public}s", folderID.UTF8String);
                     }
-                });
+        });
             }];
             NSMutableArray *children = [NSMutableArray array];
             if (menu != nil) {
