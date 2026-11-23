@@ -1311,6 +1311,11 @@ static BOOL APLSimpleFaceIDEnabled(void) {
 @implementation APLBiometricMatcher
 
 - (void)start {
+    // BiometricKit may check conformance before it calls back.
+    Protocol *clientProtocol = NSProtocolFromString(@"BiometricKitXPCClientDelegate");
+    if (clientProtocol != nil) {
+        class_addProtocol([APLBiometricMatcher class], clientProtocol);
+    }
     Class managerClass = NSClassFromString(@"BKDeviceManager");
     NSArray *devices = nil;
     // BiometricKit answers with +availableDevices (and +availableDevicesWithFailure:).
@@ -1325,13 +1330,37 @@ static BOOL APLSimpleFaceIDEnabled(void) {
         }
     }
     if (![devices isKindOfClass:[NSArray class]] || devices.count == 0) {
-        os_log(TweakLog(), "no biometric device, falling back");
+        os_log(TweakLog(), "no biometric device (%{public}s), falling back", [[devices description] UTF8String] ?: "nil");
         [self finish:NO unavailable:YES];
         return;
     }
-    id device = devices.firstObject;
+    os_log(TweakLog(), "biometric device %{public}s", [[devices.firstObject description] UTF8String] ?: "nil");
+    // availableDevices hands back descriptors; the device is built from one.
+    id descriptor = devices.firstObject;
+    Class deviceClass = NSClassFromString(@"BKDevice");
+    id device = nil;
+    SEL withDescriptor = NSSelectorFromString(@"deviceWithDescriptor:error:");
+    if (deviceClass != Nil && [deviceClass respondsToSelector:withDescriptor]) {
+        NSError *error = nil;
+        device = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(deviceClass, withDescriptor, descriptor, &error);
+        os_log(TweakLog(), "device from descriptor %{public}s error %{public}s",
+               [[device description] UTF8String] ?: "nil", error.localizedDescription.UTF8String ?: "(none)");
+    }
+    if (device == nil && deviceClass != Nil) {
+        device = [[deviceClass alloc] init];
+        SEL setDescriptor = NSSelectorFromString(@"setDescriptor:");
+        if ([device respondsToSelector:setDescriptor]) {
+            [device performSelector:setDescriptor withObject:descriptor];
+        }
+    }
+    if (device == nil) {
+        os_log(TweakLog(), "no device built from the descriptor");
+        [self finish:NO unavailable:YES];
+        return;
+    }
     SEL createSelector = NSSelectorFromString(@"createMatchOperationWithError:");
     if (![device respondsToSelector:createSelector]) {
+        os_log(TweakLog(), "device cannot create a match operation");
         [self finish:NO unavailable:YES];
         return;
     }
@@ -1346,6 +1375,10 @@ static BOOL APLSimpleFaceIDEnabled(void) {
     self.operation = operation;
     if ([operation respondsToSelector:NSSelectorFromString(@"setDelegate:")]) {
         [operation performSelector:NSSelectorFromString(@"setDelegate:") withObject:self];
+    }
+    // The XPC client callbacks may come to the device's delegate instead.
+    if ([device respondsToSelector:NSSelectorFromString(@"setDelegate:")]) {
+        [device performSelector:NSSelectorFromString(@"setDelegate:") withObject:self];
     }
     if ([operation respondsToSelector:NSSelectorFromString(@"setQueue:")]) {
         [operation performSelector:NSSelectorFromString(@"setQueue:") withObject:dispatch_get_main_queue()];
@@ -1426,6 +1459,21 @@ static BOOL APLSimpleFaceIDEnabled(void) {
     self.completion = nil;
     [self stopOperation];
     self.operation = nil;
+}
+
+// TEMP: log whatever BiometricKit calls back with, so the real delegate
+// selectors show up in the log.
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
+    NSString *name = NSStringFromSelector(selector);
+    if ([name containsString:@"match"] || [name containsString:@"operation"] || [name containsString:@"finish"]) {
+        return [NSMethodSignature signatureWithObjCTypes:"v@:@"];
+    }
+    return [super methodSignatureForSelector:selector];
+}
+
+- (void)forwardInvocation:(NSInvocation *)invocation {
+    os_log(TweakLog(), "bk callback %{public}s", NSStringFromSelector(invocation.selector).UTF8String);
+    [self finish:NO unavailable:NO];
 }
 
 @end
@@ -1586,6 +1634,29 @@ static void APLSetupSpringBoardService(void) {
         [warm canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:&warmError];
     });
 
+
+    // TEMP self test: a marker file in the preferences folder asks for island
+    // checks while it exists, so a log window catches them whenever it opens.
+    NSString *markerName = @"/var/mobile/Library/Preferences/com.404.facelock.selftest";
+    NSString *markerBootstrap = ApelinBootstrapPath(markerName);
+    NSString *marker = markerBootstrap.length > 0
+        ? markerBootstrap
+        : markerName;
+    BOOL markerSeen = [[NSFileManager defaultManager] fileExistsAtPath:marker];
+    os_log(TweakLog(), "selftest marker %{public}s seen=%d", marker.UTF8String, (int)markerSeen);
+    if (markerSeen) {
+        static int selftestCount;
+        [NSTimer scheduledTimerWithTimeInterval:10.0 repeats:YES block:^(NSTimer *timer) {
+            if (++selftestCount > 12) {
+                [timer invalidate];
+                return;
+            }
+            os_log(TweakLog(), "selftest starting %d", selftestCount);
+            APLAskWithIsland(^(BOOL success, BOOL unavailable) {
+                os_log(TweakLog(), "selftest done success=%d unavailable=%d", (int)success, (int)unavailable);
+            });
+        }];
+    }
 
     // A long press on a home screen icon offers a switch for that app's lock.
     Class iconViewClass = NSClassFromString(@"SBIconView");
