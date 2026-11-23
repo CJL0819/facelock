@@ -946,7 +946,6 @@ static void APLIslandWorking(void);
 static void APLIslandResult(BOOL success);
 static void APLIslandHide(void);
 static BOOL APLSimpleFaceIDEnabled(void);
-static void APLHideRemoteOverlay(BOOL hide);
 
 static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
     os_log(TweakLog(), "Face ID requested by %{public}s", bundleID.UTF8String);
@@ -962,43 +961,7 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
     sAuthContextTokens[bundleID] = @(token);
 
     NSString *reason = [NSString stringWithFormat:@"解锁“%@”", APLDisplayNameForBundle(bundleID)];
-    // 简化面容识别动画: the system's sheet is hidden by CoreAuthUI, so the island
-    // shows the check instead.
-    BOOL island = APLSimpleFaceIDEnabled();
-    if (island) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            APLHideRemoteOverlay(YES);
-        });
-        APLHideRemoteOverlay(YES);
-        for (int tick = 0; tick < 12; tick++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 + tick * 0.15) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                APLHideRemoteOverlay(YES);
-            });
-        }
-        APLIslandWorking();
-        // TEMP: dump what SpringBoard puts up for this prompt.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSMutableString *dump = [NSMutableString string];
-            for (UIWindow *window in [UIApplication sharedApplication].windows) {
-                NSString *rootName = NSStringFromClass([window.rootViewController class]);
-                if (window.isHidden || ![rootName containsString:@"RemoteTransientOverlay"]) { continue; }
-                NSMutableArray *stack = [NSMutableArray arrayWithObject:@[window, @0]];
-                while (stack.count > 0) {
-                    NSArray *pair = stack.lastObject;
-                    [stack removeLastObject];
-                    UIView *v = pair[0];
-                    int depth = [pair[1] intValue];
-                    if (depth > 12) { continue; }
-                    UIColor *bg = v.backgroundColor; CGFloat r = 0, g = 0, b = 0, a = 0;
-                    [bg getRed:&r green:&g blue:&b alpha:&a];
-                    [dump appendFormat:@"%d %s %.0fx%.0f bg %.2f/%.2f/%.2f/%.2f alpha %.2f hidden %d layer %d corner %.0f\n",
-                     depth, NSStringFromClass([v class]).UTF8String, v.frame.size.width, v.frame.size.height, r, g, b, a, v.alpha, (int)v.hidden, (int)(v.layer.contents != nil), v.layer.cornerRadius];
-                    for (UIView *child in v.subviews) { [stack addObject:@[child, @(depth + 1)]]; }
-                }
-            }
-            APLWriteLockValue(@"sbDump", dump);
-        });
-    }
+    BOOL island = NO;
     [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
             localizedReason:reason
                       reply:^(BOOL success, NSError *error) {
@@ -1013,7 +976,6 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
             [sAuthContextTokens removeObjectForKey:bundleID];
             os_log(TweakLog(), "Face ID for %{public}s success=%d error=%{public}s",
                    bundleID.UTF8String, (int)success, error.localizedDescription.UTF8String ?: "(none)");
-            APLHideRemoteOverlay(NO);
             APLPublishAuthResult(bundleID, token, success, error.code == LAErrorUserCancel);
         });
     }];
@@ -1207,7 +1169,19 @@ static void APLAskForVerificationWithSystemUI(NSString *reason, void (^answer)(B
 
 static BOOL APLSimpleFaceIDEnabled(void) {
     NSDictionary *domain = APLReadSettingsFile();
-    return domain != nil ? APLBoolInDomain(domain, APLKeyForSimpleFaceID(), NO) : NO;
+    BOOL fromFile = domain != nil ? APLBoolInDomain(domain, APLKeyForSimpleFaceID(), NO) : NO;
+    // The sheet lives in CoreAuthUI, a sandboxed app: it may not reach the
+    // preferences file, so the same key is asked of cfprefsd as well.
+    CFBooleanRef cached = (CFBooleanRef)CFPreferencesCopyAppValue(
+        (CFStringRef)APLKeyForSimpleFaceID(), CFSTR("com.404.facelock"));
+    BOOL fromPrefs = cached != NULL ? CFBooleanGetValue(cached) : NO;
+    if (cached != NULL) {
+        CFRelease(cached);
+    }
+    if ([domain count] == 0) {
+        os_log(TweakLog(), "no settings file here; cfprefsd says %d", fromPrefs);
+    }
+    return fromFile || fromPrefs;
 }
 
 /// A black pill where the island is, grown to the right while the check runs,
@@ -1358,12 +1332,6 @@ static void APLIslandWorking(void) {
 
 static void APLIslandResult(BOOL success) {
     [[APLIslandPrompt shared] showResult:success];
-}
-
-static void APLHideRemoteOverlay(BOOL hide) {
-    // The sheet's own process clears its black backing; leaving the SpringBoard
-    // overlay alone keeps the system's green ring and tick on screen.
-    (void)hide;
 }
 
 static void APLIslandHide(void) {
@@ -2047,7 +2015,6 @@ static void HookedOpenFolder(id self, SEL _cmd, id folderIcon, id location, BOOL
 
 static void (*OriginalRun)(id self, SEL _cmd);
 
-static void APLSetupCoreAuthUIHiding(void);
 
 // -[UIApplication _run] is where UIApplicationMain settles before the app's
 // own launch callbacks, so the lock is up before the app draws anything.
@@ -2064,68 +2031,6 @@ static void HookedRun(id self, SEL _cmd) {
     }
 }
 
-#pragma mark - CoreAuthUI: the system Face ID sheet
-
-static void (*OriginalAnyViewDidMoveToWindow)(UIView *self, SEL _cmd);
-
-/// Hides the pearl glyph the system animates while it looks for a face. The
-/// passcode view stays: a failed match must still be recoverable.
-static CGFloat sSheetWindowLevel;
-static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
-    if (OriginalAnyViewDidMoveToWindow != NULL) {
-        OriginalAnyViewDidMoveToWindow(self, _cmd);
-    }
-    NSString *name = NSStringFromClass([self class]);
-    if (self.window == nil) {
-        return;
-    }
-    if (!APLSimpleFaceIDEnabled()) {
-        return;
-    }
-    if ([name containsString:@"Passcode"]) {
-        // A passcode entry means Face ID is done with: put the sheet back.
-        static NSMutableArray<UIView *> *restore;
-        if (restore == nil) {
-            restore = [NSMutableArray array];
-        }
-        for (UIView *view in restore) {
-            view.hidden = NO;
-        }
-        [restore removeAllObjects];
-        if (sSheetWindowLevel != 0) {
-            self.window.windowLevel = sSheetWindowLevel;
-        }
-        os_log(TweakLog(), "showed the sheet for the passcode");
-        return;
-    }
-    if (![name containsString:@"Pearl"]) {
-        return;
-    }
-    // The whole sheet lives in its own window: push that window behind
-    // everything, so the black card and the pearl leave the screen while the
-    // check itself keeps running in this process.
-    static CGFloat savedLevel;
-    static BOOL levelSaved;
-    if (!levelSaved) {
-        savedLevel = self.window.windowLevel;
-        levelSaved = YES;
-    }
-    sSheetWindowLevel = savedLevel;
-    self.window.windowLevel = -1000.0;
-    os_log(TweakLog(), "pushed the sheet window behind everything");
-}
-
-static void APLSetupCoreAuthUIHiding(void) {
-    Class viewClass = objc_getClass("UIView");
-    if (viewClass == Nil) {
-        return;
-    }
-    MSHookMessageEx(viewClass,
-                    sel_registerName("didMoveToWindow"),
-                    (IMP)HookedAnyViewDidMoveToWindow,
-                    (IMP *)&OriginalAnyViewDidMoveToWindow);
-    os_log(TweakLog(), "CoreAuthUI hiding installed");
-}
 
 __attribute__((constructor)) static void TweakInitialize(void) {
     // Apelin's confirm_loaded looks for this exact marker and build id under
@@ -2137,15 +2042,6 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     if (APLIsSpringBoard()) {
         dispatch_async(dispatch_get_main_queue(), ^{
             APLSetupSpringBoardService();
-        });
-        return;
-    }
-
-    // CoreAuthUI draws the system Face ID sheet; there the pearl glyph is ours
-    // to hide when 简化面容识别动画 is on.
-    if (strcmp(getprogname(), "CoreAuthUI") == 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            APLSetupCoreAuthUIHiding();
         });
         return;
     }
