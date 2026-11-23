@@ -945,10 +945,8 @@ static BOOL APLSimpleFaceIDEnabled(void);
 
 static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
     os_log(TweakLog(), "Face ID requested by %{public}s", bundleID.UTF8String);
-    if (APLSimpleFaceIDEnabled()) {
-        APLStartIslandAuth(bundleID, token);
-        return;
-    }
+    // The island's own match is on hold: BiometricKit will not hand back a
+    // result to us yet, and probing it took SpringBoard down.
     APLStartAuthEvaluationWithLA(bundleID, token);
 }
 
@@ -1305,6 +1303,7 @@ static BOOL APLSimpleFaceIDEnabled(void) {
 @interface APLBiometricMatcher : NSObject
 @property (nonatomic, copy) void (^completion)(BOOL success, BOOL unavailable);
 @property (nonatomic, strong) id operation;
+@property (nonatomic, strong) id device;
 @property (nonatomic, assign) BOOL finished;
 @end
 
@@ -1373,6 +1372,7 @@ static BOOL APLSimpleFaceIDEnabled(void) {
         return;
     }
     self.operation = operation;
+    self.device = device;
     if ([operation respondsToSelector:NSSelectorFromString(@"setDelegate:")]) {
         [operation performSelector:NSSelectorFromString(@"setDelegate:") withObject:self];
     }
@@ -1463,9 +1463,21 @@ static BOOL APLSimpleFaceIDEnabled(void) {
 
 // TEMP: log whatever BiometricKit calls back with, so the real delegate
 // selectors show up in the log.
+- (BOOL)respondsToSelector:(SEL)selector {
+    if ([super respondsToSelector:selector]) {
+        return YES;
+    }
+    // BiometricKit checks before it calls; claim the callback-shaped ones.
+    NSString *name = NSStringFromSelector(selector);
+    if ([name containsString:@"match"] || [name containsString:@"operation"] || [name containsString:@"device"]) {
+        return YES;
+    }
+    return NO;
+}
+
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
     NSString *name = NSStringFromSelector(selector);
-    if ([name containsString:@"match"] || [name containsString:@"operation"] || [name containsString:@"finish"]) {
+    if ([name containsString:@"match"] || [name containsString:@"operation"] || [name containsString:@"device"]) {
         return [NSMethodSignature signatureWithObjCTypes:"v@:@"];
     }
     return [super methodSignatureForSelector:selector];
@@ -1473,7 +1485,28 @@ static BOOL APLSimpleFaceIDEnabled(void) {
 
 - (void)forwardInvocation:(NSInvocation *)invocation {
     os_log(TweakLog(), "bk callback %{public}s", NSStringFromSelector(invocation.selector).UTF8String);
-    [self finish:NO unavailable:NO];
+}
+
+/// The one callback BiometricKit does send: ask how the operation went.
+- (void)operation:(id __unused)operation stateChanged:(NSInteger)state {
+    os_log(TweakLog(), "operation state %ld", (long)state);
+    if (state < 2 || self.finished) {
+        return;  // still running
+    }
+    SEL lastEvent = NSSelectorFromString(@"lastMatchEventWithError:");
+    if (self.device == nil || ![self.device respondsToSelector:lastEvent]) {
+        [self finish:NO unavailable:NO];
+        return;
+    }
+    NSError *error = nil;
+    id event = ((id (*)(id, SEL, NSError **))objc_msgSend)(self.device, lastEvent, &error);
+    NSInteger result = 0;
+    if ([event respondsToSelector:NSSelectorFromString(@"result")]) {
+        result = [[event performSelector:NSSelectorFromString(@"result")] integerValue];
+    }
+    os_log(TweakLog(), "match event result %ld error %{public}s",
+           (long)result, error.localizedDescription.UTF8String ?: "(none)");
+    [self finish:(result == 1) unavailable:NO];
 }
 
 @end
@@ -1539,17 +1572,7 @@ static void APLAskWithIsland(void (^answer)(BOOL success, BOOL unavailable)) {
 }
 
 static void APLAskForVerification(NSString *reason, void (^answer)(BOOL granted)) {
-    if (APLSimpleFaceIDEnabled()) {
-        APLAskWithIsland(^(BOOL success, BOOL unavailable) {
-            if (unavailable) {
-                // Nothing to draw the answer with: let iOS ask.
-                APLAskForVerificationWithSystemUI(reason, answer);
-                return;
-            }
-            answer(success);
-        });
-        return;
-    }
+    // The island's own match is on hold for now; the system prompt answers.
     APLAskForVerificationWithSystemUI(reason, answer);
 }
 
@@ -1635,28 +1658,6 @@ static void APLSetupSpringBoardService(void) {
     });
 
 
-    // TEMP self test: a marker file in the preferences folder asks for island
-    // checks while it exists, so a log window catches them whenever it opens.
-    NSString *markerName = @"/var/mobile/Library/Preferences/com.404.facelock.selftest";
-    NSString *markerBootstrap = ApelinBootstrapPath(markerName);
-    NSString *marker = markerBootstrap.length > 0
-        ? markerBootstrap
-        : markerName;
-    BOOL markerSeen = [[NSFileManager defaultManager] fileExistsAtPath:marker];
-    os_log(TweakLog(), "selftest marker %{public}s seen=%d", marker.UTF8String, (int)markerSeen);
-    if (markerSeen) {
-        static int selftestCount;
-        [NSTimer scheduledTimerWithTimeInterval:10.0 repeats:YES block:^(NSTimer *timer) {
-            if (++selftestCount > 12) {
-                [timer invalidate];
-                return;
-            }
-            os_log(TweakLog(), "selftest starting %d", selftestCount);
-            APLAskWithIsland(^(BOOL success, BOOL unavailable) {
-                os_log(TweakLog(), "selftest done success=%d unavailable=%d", (int)success, (int)unavailable);
-            });
-        }];
-    }
 
     // A long press on a home screen icon offers a switch for that app's lock.
     Class iconViewClass = NSClassFromString(@"SBIconView");
