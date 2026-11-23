@@ -1295,11 +1295,17 @@ static BOOL APLSimpleFaceIDEnabled(void) {
 
 - (void)start {
     Class managerClass = NSClassFromString(@"BKDeviceManager");
-    SEL available = NSSelectorFromString(@"availableDevicesWithError:");
     NSArray *devices = nil;
+    // BiometricKit answers with +availableDevices (and +availableDevicesWithFailure:).
+    SEL available = NSSelectorFromString(@"availableDevices");
     if (managerClass != Nil && [managerClass respondsToSelector:available]) {
-        NSError *error = nil;
-        devices = ((id (*)(id, SEL, NSError **))objc_msgSend)(managerClass, available, &error);
+        devices = ((id (*)(id, SEL))objc_msgSend)(managerClass, available);
+    } else {
+        SEL availableWithFailure = NSSelectorFromString(@"availableDevicesWithFailure:");
+        if (managerClass != Nil && [managerClass respondsToSelector:availableWithFailure]) {
+            BOOL failed = NO;
+            devices = ((id (*)(id, SEL, BOOL *))objc_msgSend)(managerClass, availableWithFailure, &failed);
+        }
     }
     if (![devices isKindOfClass:[NSArray class]] || devices.count == 0) {
         os_log(TweakLog(), "no biometric device, falling back");
@@ -1513,6 +1519,7 @@ static void APLSetupSpringBoardService(void) {
         NSError *warmError = nil;
         [warm canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:&warmError];
     });
+
 
     // A long press on a home screen icon offers a switch for that app's lock.
     Class iconViewClass = NSClassFromString(@"SBIconView");
