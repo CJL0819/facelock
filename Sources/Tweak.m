@@ -2018,7 +2018,18 @@ static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
         OriginalAnyViewDidMoveToWindow(self, _cmd);
     }
     NSString *name = NSStringFromClass([self class]);
-    if (![name containsString:@"Pearl"] || self.window == nil) {
+    if (self.window == nil) {
+        return;
+    }
+    // TEMP: what the sheet is made of.
+    static int listed;
+    if (listed < 200 && [name containsString:@"LAUI"]) {
+        listed++;
+        CGRect frame = [self convertRect:self.bounds toView:nil];
+        os_log(TweakLog(), "ca view %{public}s %{public}.0f,%{public}.0f %{public}.0fx%{public}.0f",
+               name.UTF8String, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
+    }
+    if (![name containsString:@"Pearl"]) {
         return;
     }
     if (!APLSimpleFaceIDEnabled()) {
