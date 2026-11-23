@@ -1659,6 +1659,7 @@ static void APLSetupSpringBoardService(void) {
 
 
 
+
     // A long press on a home screen icon offers a switch for that app's lock.
     Class iconViewClass = NSClassFromString(@"SBIconView");
     if (iconViewClass != Nil) {
