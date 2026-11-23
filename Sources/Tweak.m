@@ -76,11 +76,11 @@ static BOOL sProtected;
 static BOOL sLocked;
 static BOOL sAuthAttemptStarted;
 static BOOL sPrepared;
-static BOOL sFirstApply = YES;
 
 static void APLWriteUnlockRecord(uint64_t unlockedAt, uint64_t expiry);
 static void APLClearUnlockRecord(void);
 static void APLCancelAuthRequest(void);
+static void APLClearAwayStamp(void);
 static BOOL APLWriteLockValue(NSString *key, id value);
 static uint64_t APLExpiryForCurrentSettings(void);
 static BOOL sLockOnDeviceLock;
@@ -467,6 +467,7 @@ static void APLShowLock(void) {
             sLocked = NO;
             sAuthAttemptStarted = NO;
             APLWriteUnlockRecord((uint64_t)[NSDate date].timeIntervalSince1970, APLExpiryForCurrentSettings());
+            APLClearAwayStamp();  // the visit starts over from this unlock
             os_log(TweakLog(), "unlocked %{public}s", sBundleID.UTF8String ?: "");
             if (sLockWindow == nil) {
                 return;
@@ -599,6 +600,36 @@ static NSInteger APLIntegerInDomain(NSDictionary *domain, NSString *key, NSInteg
 // A stamp far in the future stands for "no expiry": the lock delay is off.
 static const uint64_t APLUnlockNeverExpires = 4102444800ULL;  // 2100-01-01
 
+// When the app last went to the background, kept in its own container so the
+// delay is judged by how long the app was away, not by whether iOS kept the
+// process alive: a killed app must not turn a 5-minute delay into "immediate".
+static NSString *APLAwayRecordPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/com.404.facelock.away"];
+}
+
+static uint64_t APLReadAwayStamp(void) {
+    NSString *text = [NSString stringWithContentsOfFile:APLAwayRecordPath()
+                                               encoding:NSUTF8StringEncoding
+                                                  error:NULL];
+    if (text == nil) {
+        return 0;
+    }
+    unsigned long long stamp = 0;
+    if (sscanf(text.UTF8String, "%llu", &stamp) != 1) {
+        return 0;
+    }
+    return (uint64_t)stamp;
+}
+
+static void APLWriteAwayStamp(uint64_t stamp) {
+    NSString *text = [NSString stringWithFormat:@"%llu", stamp];
+    [text writeToFile:APLAwayRecordPath() atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+}
+
+static void APLClearAwayStamp(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:APLAwayRecordPath() error:NULL];
+}
+
 // The app's own container, so the record outlives the process: after iOS kills
 // a backgrounded app, opening it again inside the delay must not ask again.
 static NSString *APLUnlockRecordPath(void) {
@@ -662,30 +693,11 @@ static uint64_t APLExpiryForCurrentSettings(void) {
     return (uint64_t)[NSDate date].timeIntervalSince1970 + (uint64_t)sLockDelay;
 }
 
-static BOOL APLUnlockRecordStillHolds(void) {
-    uint64_t unlockedAt = 0;
-    uint64_t expiry = 0;
-    if (!APLReadUnlockRecord(&unlockedAt, &expiry) || expiry == 0) {
-        return NO;
-    }
-    uint64_t locked = APLDeviceLockStamp();
-    if (locked > unlockedAt) {
-        os_log(TweakLog(), "the device locked since that unlock");
-        return NO;
-    }
-    if (expiry >= APLUnlockNeverExpires) {
-        return YES;
-    }
-    return (uint64_t)[NSDate date].timeIntervalSince1970 < expiry;
-}
-
 static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
     if (sBundleID.length == 0) {
         return;
     }
     BOOL wasProtected = sProtected;
-    BOOL firstApply = sFirstApply;
-    sFirstApply = NO;
     sEnabled = enabled;
     sProtected = protected;
     sLockDelay = domain != nil ? APLIntegerInDomain(domain, APLKeyForLockDelay(), 0) : 0;
@@ -703,22 +715,32 @@ static void APLApplyDomain(NSDictionary *domain, BOOL enabled, BOOL protected) {
         return;
     }
     if (!wasProtected) {
-        // A launch inside the delay the pane set does not ask again, even if
-        // iOS ended the app in the background since; turning protection on now
-        // always locks.
-        BOOL recordHolds = firstApply && APLUnlockRecordStillHolds();
-        if (recordHolds && sLockDelay == 0) {
-            recordHolds = NO;  // "立即": every launch asks
-        }
-        if (recordHolds && sLockDelay > 0) {
-            uint64_t unlockedAt = 0;
-            uint64_t expiry = 0;
-            if (APLReadUnlockRecord(&unlockedAt, &expiry) && expiry >= APLUnlockNeverExpires) {
-                recordHolds = NO;  // written while the delay was off, now it is on
+        // 不锁定 never asks; 立即 asks on every launch; a delay asks only once
+        // the app has been away longer than that. "Away" is measured from the
+        // moment it went to the background and kept in its container, so iOS
+        // ending the process cannot shorten a five-minute delay to nothing.
+        BOOL shouldLock = YES;
+        uint64_t now = (uint64_t)[NSDate date].timeIntervalSince1970;
+        if (sLockDelay < 0) {
+            shouldLock = NO;
+        } else if (sLockDelay > 0) {
+            uint64_t awayAt = APLReadAwayStamp();
+            if (awayAt > 0 && now >= awayAt && now - awayAt < (uint64_t)sLockDelay) {
+                shouldLock = NO;
             }
         }
-        if (recordHolds) {
-            os_log(TweakLog(), "still unlocked from an earlier session");
+        APLClearAwayStamp();
+        if (!shouldLock && sLockOnDeviceLock) {
+            // The device locked while the app was away: that always asks, even
+            // with 不锁定, unless the switch for it is off.
+            uint64_t unlockedAt = 0;
+            uint64_t expiry = 0;
+            if (!APLReadUnlockRecord(&unlockedAt, &expiry) || APLDeviceLockStamp() > unlockedAt) {
+                shouldLock = YES;
+            }
+        }
+        if (!shouldLock) {
+            os_log(TweakLog(), "still inside the delay, no lock on this launch");
             sLocked = NO;
             APLHideLockWindow();
             return;
@@ -790,14 +812,20 @@ static void APLInstallObservers(void) {
         if (!sEnabled || !sProtected) {
             return;
         }
-        // Back from the background: lock once the chosen wait has passed.
-        if (!sLocked && sBackgroundDate != nil && sLockDelay > 0) {
-            NSTimeInterval away = -[sBackgroundDate timeIntervalSinceNow];
-            if (away >= (NSTimeInterval)sLockDelay) {
-                os_log(TweakLog(), "away %.0fs, locking", away);
+        // Back from the background: 不锁定 never asks; a delay asks once the app
+        // has been away that long, whether or not iOS kept the process.
+        if (!sLocked && sLockDelay > 0) {
+            uint64_t now = (uint64_t)[NSDate date].timeIntervalSince1970;
+            uint64_t awayAt = APLReadAwayStamp();
+            if (awayAt == 0 && sBackgroundDate != nil) {
+                awayAt = (uint64_t)sBackgroundDate.timeIntervalSince1970;
+            }
+            if (awayAt > 0 && now >= awayAt && now - awayAt >= (uint64_t)sLockDelay) {
+                os_log(TweakLog(), "away %llus, locking", now - awayAt);
                 APLLockApp();
             }
         }
+        APLClearAwayStamp();
         sBackgroundDate = nil;
         if (!sLocked) {
             return;
@@ -816,6 +844,7 @@ static void APLInstallObservers(void) {
             return;
         }
         sBackgroundDate = [NSDate date];
+        APLWriteAwayStamp((uint64_t)[NSDate date].timeIntervalSince1970);
         APLCancelAuthRequest();  // no Face ID over the home screen
         if (sLockDelay == 0) {
             APLLockApp();
