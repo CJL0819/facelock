@@ -14,6 +14,7 @@
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <UIKit/UIKit.h>
 #import <notify.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <stdlib.h>
@@ -1077,6 +1078,23 @@ static void APLRefreshAuthListeners(void) {
 
 // SpringBoard runs from boot to shutdown, so its stamp of the last device lock
 // is what a suspended or killed app can still be held to.
+static BOOL APLDeviceIsReallyLocked(void) {
+    Class lockScreenClass = NSClassFromString(@"SBLockScreenManager");
+    if (lockScreenClass == Nil) {
+        return YES;  // nothing to ask: keep the old behaviour
+    }
+    SEL sharedSelector = NSSelectorFromString(@"sharedInstanceIfExists");
+    if (![lockScreenClass respondsToSelector:sharedSelector]) {
+        return YES;
+    }
+    id manager = ((id (*)(id, SEL))objc_msgSend)(lockScreenClass, sharedSelector);
+    SEL lockedSelector = NSSelectorFromString(@"isUILocked");
+    if (manager == nil || ![manager respondsToSelector:lockedSelector]) {
+        return YES;
+    }
+    return ((BOOL (*)(id, SEL))objc_msgSend)(manager, lockedSelector);
+}
+
 static void APLPublishDeviceLockStamp(void) {
     static int handle;
     if (handle == 0 && notify_register_check(APLDeviceLockStampName().UTF8String, &handle) != NOTIFY_STATUS_OK) {
@@ -1087,6 +1105,20 @@ static void APLPublishDeviceLockStamp(void) {
     notify_set_state(handle, (uint64_t)[NSDate date].timeIntervalSince1970);
     notify_post(APLDeviceLockStampName().UTF8String);
     os_log(TweakLog(), "device lock stamped");
+}
+
+// `com.apple.springboard.lockcomplete` also arrives when the cover sheet comes
+// down over an app — Notification Center, that is — which is not a lock at all.
+// Only stamp when the device is really locked, once SpringBoard has settled.
+static void APLNotePossibleDeviceLock(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!APLDeviceIsReallyLocked()) {
+            os_log(TweakLog(), "not a device lock, stamp left alone");
+            return;
+        }
+        APLPublishDeviceLockStamp();
+    });
 }
 
 
@@ -1159,13 +1191,13 @@ static void APLSetupSpringBoardService(void) {
     // passcode-protected data goes away.
     static int lockToken;
     notify_register_dispatch("com.apple.springboard.lockcomplete", &lockToken, dispatch_get_main_queue(), ^(int __unused note) {
-        APLPublishDeviceLockStamp();
+        APLNotePossibleDeviceLock();
     });
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationProtectedDataWillBecomeUnavailable
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *__unused note) {
-        APLPublishDeviceLockStamp();
+        APLNotePossibleDeviceLock();
     }];
 
     // An app installed after the service started would have no listener, so its
