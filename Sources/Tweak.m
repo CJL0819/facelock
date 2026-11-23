@@ -1206,8 +1206,9 @@ static void APLAskForVerificationWithSystemUI(NSString *reason, void (^answer)(B
 // never draws its own square sheet, and the island is stretched by us instead.
 
 static BOOL APLSimpleFaceIDEnabled(void) {
-    NSDictionary *domain = APLReadSettingsFile();
-    return domain != nil ? APLBoolInDomain(domain, APLKeyForSimpleFaceID(), NO) : NO;
+    // On hold: the sheet's black card is drawn by the system's presentation
+    // container, which cannot be taken off the screen from here.
+    return NO;
 }
 
 /// A black pill where the island is, grown to the right while the check runs,
