@@ -972,7 +972,24 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
         });
     }];
 
-    // iOS keeps its sheet up after a failed match, with its own retry inside it.
+    // TEMP: what the system put on screen for this prompt.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+            NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
+            while (stack.count > 0) {
+                UIView *view = stack.lastObject;
+                [stack removeLastObject];
+                NSString *name = NSStringFromClass([view class]);
+                if ([name containsString:@"LAUI"] || [name containsString:@"Pearl"]) {
+                    os_log(TweakLog(), "laui view %{public}s frame %{public}.0f,%{public}.0f %{public}.0fx%{public}.0f",
+                           name.UTF8String, view.frame.origin.x, view.frame.origin.y,
+                           view.frame.size.width, view.frame.size.height);
+                }
+                [stack addObjectsFromArray:view.subviews];
+            }
+        }
+    });
     // This gives one attempt a life of its own: when nothing comes back in three
     // seconds, close the sheet and answer, so the lock screen opens a fresh one.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1588,6 +1605,17 @@ static void APLAskForVerificationWithSystemUI(NSString *reason, void (^answer)(B
     }];
 }
 
+static BOOL APLWriteLockValue(NSString *key, id value);
+
+static void (*OriginalLAUIViewDidMoveToWindow)(UIView *self, SEL _cmd);
+
+static void HookedLAUIViewDidMoveToWindow(UIView *self, SEL _cmd) {
+    if (OriginalLAUIViewDidMoveToWindow != NULL) {
+        OriginalLAUIViewDidMoveToWindow(self, _cmd);
+    }
+    os_log(TweakLog(), "lauhook %{public}s in window=%d", NSStringFromClass([self class]).UTF8String, (int)(self.window != nil));
+}
+
 static void APLSetupSpringBoardService(void) {
     static int changeToken;
     APLRefreshAuthListeners();
@@ -1659,6 +1687,35 @@ static void APLSetupSpringBoardService(void) {
 
 
 
+
+    // TEMP: which Face ID UI classes this system has.
+    {
+        NSMutableString *list = [NSMutableString string];
+        int classCount = objc_getClassList(NULL, 0);
+        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)classCount);
+        classCount = objc_getClassList(classes, classCount);
+        for (int index = 0; index < classCount; index++) {
+            const char *name = class_getName(classes[index]);
+            if (strcasestr(name, "pearl") || strcasestr(name, "faceid") ||
+                strcasestr(name, "laui") || strcasestr(name, "biometric")) {
+                [list appendFormat:@"%s ", name];
+            }
+        }
+        free(classes);
+        APLWriteLockValue(@"faceClasses", list);
+    }
+
+    // Watch the system Face ID views come into a window.
+    for (NSString *className in @[@"LAUIPearlGlyphView", @"LAUIAuthenticationView",
+                                  @"LAUIPasscodeView", @"LAUIPhysicalButtonView"]) {
+        Class cls = NSClassFromString(className);
+        if (cls == Nil) {
+            os_log(TweakLog(), "lauhook %{public}s missing", className.UTF8String);
+            continue;
+        }
+        MSHookMessageEx(cls, @selector(didMoveToWindow), (IMP)HookedLAUIViewDidMoveToWindow, (IMP *)&OriginalLAUIViewDidMoveToWindow);
+        os_log(TweakLog(), "lauhook %{public}s hooked", className.UTF8String);
+    }
 
     // A long press on a home screen icon offers a switch for that app's lock.
     Class iconViewClass = NSClassFromString(@"SBIconView");
@@ -1933,6 +1990,8 @@ static void HookedOpenFolder(id self, SEL _cmd, id folderIcon, id location, BOOL
 
 static void (*OriginalRun)(id self, SEL _cmd);
 
+static void APLSetupCoreAuthUIHiding(void);
+
 // -[UIApplication _run] is where UIApplicationMain settles before the app's
 // own launch callbacks, so the lock is up before the app draws anything.
 static BOOL APLIsSpringBoard(void) {
@@ -1948,6 +2007,39 @@ static void HookedRun(id self, SEL _cmd) {
     }
 }
 
+#pragma mark - CoreAuthUI: the system Face ID sheet
+
+static void (*OriginalAnyViewDidMoveToWindow)(UIView *self, SEL _cmd);
+
+/// Hides the pearl glyph the system animates while it looks for a face. The
+/// passcode view stays: a failed match must still be recoverable.
+static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
+    if (OriginalAnyViewDidMoveToWindow != NULL) {
+        OriginalAnyViewDidMoveToWindow(self, _cmd);
+    }
+    NSString *name = NSStringFromClass([self class]);
+    if (![name containsString:@"Pearl"] || self.window == nil) {
+        return;
+    }
+    if (!APLSimpleFaceIDEnabled()) {
+        return;
+    }
+    self.hidden = YES;
+    os_log(TweakLog(), "hid %{public}s", name.UTF8String);
+}
+
+static void APLSetupCoreAuthUIHiding(void) {
+    Class viewClass = objc_getClass("UIView");
+    if (viewClass == Nil) {
+        return;
+    }
+    MSHookMessageEx(viewClass,
+                    sel_registerName("didMoveToWindow"),
+                    (IMP)HookedAnyViewDidMoveToWindow,
+                    (IMP *)&OriginalAnyViewDidMoveToWindow);
+    os_log(TweakLog(), "CoreAuthUI hiding installed");
+}
+
 __attribute__((constructor)) static void TweakInitialize(void) {
     // Apelin's confirm_loaded looks for this exact marker and build id under
     // the package id's subsystem. Keep the line, and keep it public.
@@ -1958,6 +2050,15 @@ __attribute__((constructor)) static void TweakInitialize(void) {
     if (APLIsSpringBoard()) {
         dispatch_async(dispatch_get_main_queue(), ^{
             APLSetupSpringBoardService();
+        });
+        return;
+    }
+
+    // CoreAuthUI draws the system Face ID sheet; there the pearl glyph is ours
+    // to hide when 简化面容识别动画 is on.
+    if (strcmp(getprogname(), "CoreAuthUI") == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            APLSetupCoreAuthUIHiding();
         });
         return;
     }
