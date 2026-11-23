@@ -941,6 +941,9 @@ static NSMutableDictionary<NSString *, NSNumber *> *sAuthContextTokens;
 
 static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token);
 static void APLStartIslandAuth(NSString *bundleID, uint32_t token);
+static void APLIslandWorking(void);
+static void APLIslandResult(BOOL success);
+static void APLIslandHide(void);
 static BOOL APLSimpleFaceIDEnabled(void);
 
 static void APLStartAuthEvaluation(NSString *bundleID, uint32_t token) {
@@ -957,10 +960,19 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
     sAuthContextTokens[bundleID] = @(token);
 
     NSString *reason = [NSString stringWithFormat:@"解锁“%@”", APLDisplayNameForBundle(bundleID)];
+    // 简化面容识别动画: the system's sheet is hidden by CoreAuthUI, so the island
+    // shows the check instead.
+    BOOL island = APLSimpleFaceIDEnabled();
+    if (island) {
+        APLIslandWorking();
+    }
     [context evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
             localizedReason:reason
                       reply:^(BOOL success, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (island) {
+                APLIslandResult(success);
+            }
             if (sAuthContexts[bundleID] != context) {
                 return;  // a newer request took over
             }
@@ -972,31 +984,14 @@ static void APLStartAuthEvaluationWithLA(NSString *bundleID, uint32_t token) {
         });
     }];
 
-    // TEMP: what the system put on screen for this prompt.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        for (UIWindow *window in [UIApplication sharedApplication].windows) {
-            NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
-            while (stack.count > 0) {
-                UIView *view = stack.lastObject;
-                [stack removeLastObject];
-                NSString *name = NSStringFromClass([view class]);
-                if ([name containsString:@"LAUI"] || [name containsString:@"Pearl"]) {
-                    os_log(TweakLog(), "laui view %{public}s frame %{public}.0f,%{public}.0f %{public}.0fx%{public}.0f",
-                           name.UTF8String, view.frame.origin.x, view.frame.origin.y,
-                           view.frame.size.width, view.frame.size.height);
-                }
-                [stack addObjectsFromArray:view.subviews];
-            }
-        }
-    });
-    // This gives one attempt a life of its own: when nothing comes back in three
-    // seconds, close the sheet and answer, so the lock screen opens a fresh one.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (sAuthContexts[bundleID] != context) {
             return;  // answered, or replaced by a newer request
         }
         os_log(TweakLog(), "closing an unanswered Face ID dialog for %{public}s", bundleID.UTF8String);
+        if (island) {
+            APLIslandHide();
+        }
         [sAuthContexts removeObjectForKey:bundleID];
         [sAuthContextTokens removeObjectForKey:bundleID];
         [context invalidate];
@@ -1312,6 +1307,18 @@ static BOOL APLSimpleFaceIDEnabled(void) {
     [self hide];
 }
 
+
+static void APLIslandWorking(void) {
+    [[APLIslandPrompt shared] showWorking];
+}
+
+static void APLIslandResult(BOOL success) {
+    [[APLIslandPrompt shared] showResult:success];
+}
+
+static void APLIslandHide(void) {
+    [[APLIslandPrompt shared] hideSilently];
+}
 @end
 
 /// Runs the match, telling the caller whether Face ID said yes. `unavailable`
@@ -2021,22 +2028,27 @@ static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
     if (self.window == nil) {
         return;
     }
-    // TEMP: what the sheet is made of.
-    static int listed;
-    if (listed < 200 && [name containsString:@"LAUI"]) {
-        listed++;
-        CGRect frame = [self convertRect:self.bounds toView:nil];
-        os_log(TweakLog(), "ca view %{public}s %{public}.0f,%{public}.0f %{public}.0fx%{public}.0f",
-               name.UTF8String, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
+    if (!APLSimpleFaceIDEnabled()) {
+        return;
+    }
+    if ([name containsString:@"Passcode"]) {
+        // A passcode entry means Face ID is done with: show the sheet again.
+        if (self.window.hidden) {
+            self.window.hidden = NO;
+            os_log(TweakLog(), "showed the sheet for the passcode");
+        }
+        return;
     }
     if (![name containsString:@"Pearl"]) {
         return;
     }
-    if (!APLSimpleFaceIDEnabled()) {
-        return;
-    }
+    // The pearl is the whole square panel: take it off the screen, and with it
+    // the animation the person would otherwise see.
     self.hidden = YES;
-    os_log(TweakLog(), "hid %{public}s", name.UTF8String);
+    if (!self.window.hidden) {
+        self.window.hidden = YES;
+        os_log(TweakLog(), "hid the sheet window");
+    }
 }
 
 static void APLSetupCoreAuthUIHiding(void) {
