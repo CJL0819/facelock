@@ -2032,23 +2032,51 @@ static void HookedAnyViewDidMoveToWindow(UIView *self, SEL _cmd) {
         return;
     }
     if ([name containsString:@"Passcode"]) {
-        // A passcode entry means Face ID is done with: show the sheet again.
+        // A passcode entry means Face ID is done with: put the sheet back.
+        static NSMutableArray<UIView *> *restore;
+        if (restore == nil) {
+            restore = [NSMutableArray array];
+        }
+        for (UIView *view in restore) {
+            view.hidden = NO;
+        }
+        [restore removeAllObjects];
         if (self.window.hidden) {
             self.window.hidden = NO;
-            os_log(TweakLog(), "showed the sheet for the passcode");
         }
+        os_log(TweakLog(), "showed the sheet for the passcode");
         return;
     }
     if (![name containsString:@"Pearl"]) {
         return;
     }
-    // The pearl is the whole square panel: take it off the screen, and with it
-    // the animation the person would otherwise see.
-    self.hidden = YES;
-    if (!self.window.hidden) {
-        self.window.hidden = YES;
-        os_log(TweakLog(), "hid the sheet window");
+    // The sheet is mirrored into SpringBoard as a remote view, so only the
+    // views themselves can be taken off it: hide the pearl and every layer
+    // around it, up to the sheet's root, leaving the passcode its place.
+    static NSMutableArray<UIView *> *hidden;
+    if (hidden == nil) {
+        hidden = [NSMutableArray array];
     }
+    UIView *rootView = self.window.rootViewController.view;
+    self.window.backgroundColor = [UIColor clearColor];
+    rootView.backgroundColor = [UIColor clearColor];
+    UIView *view = self;
+    while (view != nil && view != rootView) {
+        if (!view.hidden) {
+            view.hidden = YES;
+            [hidden addObject:view];
+        }
+        if (view.superview != rootView && view.superview != nil) {
+            for (UIView *sibling in view.superview.subviews) {
+                if (sibling != view && !sibling.hidden) {
+                    sibling.hidden = YES;
+                    [hidden addObject:sibling];
+                }
+            }
+        }
+        view = view.superview;
+    }
+    os_log(TweakLog(), "hid the sheet (%lu views)", (unsigned long)hidden.count);
 }
 
 static void APLSetupCoreAuthUIHiding(void) {
